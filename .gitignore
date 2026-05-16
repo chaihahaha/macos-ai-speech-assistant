@@ -1,2 +1,3 @@
-conversation_history
-.build
+.build/
+Package.resolved
+conversation_history/

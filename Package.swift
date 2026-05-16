@@ -5,7 +5,7 @@ let package = Package(
     name: "MyLlamaSpeechAssistant",
     platforms: [.macOS(.v14)],
     dependencies: [
-        .package(path: "../personaplex-mlx-swift/speech-swift"),
+        .package(path: "Dependencies/speech-swift"),
     ],
     targets: [
         .executableTarget(
