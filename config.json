@@ -1,0 +1,39 @@
+{
+  "backend": "llamacpp",
+  "llamacpp": {
+    "serverURL": "http://127.0.0.1:8080",
+    "maxTokens": 4096,
+    "systemPrompt": "You are a helpful assistant. Provide concise responses."
+  },
+  "opencode": {
+    "serverURL": "http://127.0.0.1:9999",
+    "providerID": "llama.cpp",
+    "modelID": "qwen3.6",
+    "agent": "general",
+    "directory": "/Users/hasee/source"
+  },
+  "models": {
+    "asrPath": "/Users/hasee/source/personaplex-mlx-swift/Qwen3-ASR-0.6B-MLX-4bit",
+    "asrFallbackPaths": [
+      "../../../../../Qwen3-ASR-0.6B-MLX-4bit"
+    ],
+    "vadPath": "/Users/hasee/source/personaplex-mlx-swift/Silero-VAD-v5-MLX",
+    "vadFallbackPaths": [
+      "../../../../../Silero-VAD-v5-MLX"
+    ]
+  },
+  "vad": {
+    "onset": 0.5,
+    "offset": 0.35,
+    "minSpeechDuration": 0.25,
+    "minSilenceDuration": 1.0,
+    "silenceTimeout": 5.0,
+    "maxRecordingDuration": 60.0
+  },
+  "tts": {
+    "rate": 0.95,
+    "slowRate": 0.5,
+    "fastRate": 1.3
+  },
+  "conversationHistoryPath": "~/source/ai_talk_ideas"
+}

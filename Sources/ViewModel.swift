@@ -7,7 +7,7 @@ import AudioCommon
 @MainActor
 final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     // MARK: - State
-    
+
     enum ConversationState: String {
         case inactive
         case listening
@@ -16,7 +16,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         case generating
         case speaking
     }
-    
+
     @Published var conversationState: ConversationState = .inactive
     @Published var isLoading = false
     @Published var loadingStatus: String?
@@ -25,93 +25,168 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @Published var debugInfo: String = ""
     @Published var isTyping = false
     @Published var silenceTimerValue: Double = 5.0
-    
+
     // MARK: - Private
-    
+
     private var asrModel: Qwen3ASRModel?
     private var vadModel: SileroVADModel?
     private var recorder: AudioRecorder?
     private var conversationTask: Task<Void, Never>?
     private var llamaTask: Task<Void, Error>?
     private var asrTask: Task<String, Error>?
-    
-    // LLM config
-    private let llamaServerURL = "http://127.0.0.1:8080"
-    private let silenceTimeout: TimeInterval = 5.0
-    
+    private var opencodeClient: OpencodeClient?
+    private var opencodeServerProcess: Process?
+
+    // Config
+    private let appConfig: AppConfig
+    private var ttsRate: Float
+
     // Built-in macOS TTS
     private let speechSynthesizer = AVSpeechSynthesizer()
     private var pendingSentence: String = ""
     private var hasStartedSpeaking = false
-    
+
     // TTS utterance tracking
     private var pendingUtteranceCount = 0
     private var streamingComplete = false
-    
+
     // Conversation logging
     private var conversationLogFile: URL?
     private var conversationLogHandle: FileHandle?
-    
+
     // ASR buffer for silence-based sending
     private var asrBuffer: [Float] = []
     private var pendingAudio: [Float] = []
     private var lastSpeechEndTime: Date?
     private var silenceTimer: Timer?
     private var pendingSendTask: Task<Void, Never>?
-    
+    private var maxRecordingTimer: Timer?
+
+    // Media key controller
+    private let mediaKeys = MediaKeyController()
+
+    // Shared URLSession for LLM streaming (avoids session leaks)
+    private lazy var streamingSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 300
+        config.timeoutIntervalForResource = 600
+        return URLSession(configuration: config)
+    }()
+
     override init() {
+        appConfig = AppConfig.load()
+        ttsRate = appConfig.tts.rate
         super.init()
         speechSynthesizer.delegate = self
         setupConversationLogging()
+        setupMediaKeys()
     }
-    
+
+    // MARK: - Media Key Setup
+
+    private func setupMediaKeys() {
+        mediaKeys.setHandlers(
+            playPause: { [weak self] in self?.toggleTTSSpeed() },
+            nextTrack: { [weak self] in self?.interruptConversation() },
+            previousTrack: { [weak self] in self?.repeatLastResponse() }
+        )
+        mediaKeys.becomeNowPlaying()
+    }
+
+    deinit {
+        speechSynthesizer.stopSpeaking(at: .immediate)
+        llamaTask?.cancel()
+        pendingSendTask?.cancel()
+        maxRecordingTimer?.invalidate()
+        silenceTimer?.invalidate()
+        opencodeClient?.reset()
+        opencodeServerProcess?.terminate()
+        try? conversationLogHandle?.close()
+    }
+
+    private func toggleTTSSpeed() {
+        if ttsRate == appConfig.tts.slowRate {
+            ttsRate = appConfig.tts.fastRate
+            debugInfo = "TTS: fast mode"
+        } else {
+            ttsRate = appConfig.tts.slowRate
+            debugInfo = "TTS: slow mode"
+        }
+        print("[MediaKey] TTS rate: \(ttsRate)")
+    }
+
+    private func interruptConversation() {
+        print("[MediaKey] Interrupting conversation")
+        guard conversationState != .inactive else { return }
+        speechSynthesizer.stopSpeaking(at: .immediate)
+        pendingUtteranceCount = 0
+        streamingComplete = false
+        pendingSentence = ""
+
+        llamaTask?.cancel()
+        llamaTask = nil
+        Task { await opencodeClient?.abort() }
+
+        if let lastUserMsg = messages.last(where: { $0.role == .user }) {
+            messages.removeAll { msg in
+                msg.id == lastUserMsg.id || (msg.role == .assistant && msg.timestamp >= lastUserMsg.timestamp)
+            }
+        }
+        stopConversation()
+        debugInfo = "Interrupted"
+    }
+
+    private func repeatLastResponse() {
+        guard let lastResponse = messages.last(where: { $0.role == .assistant }) else { return }
+        print("[MediaKey] Repeating last response")
+        speakSentence(lastResponse.text)
+    }
+
     // MARK: - Conversation Logging
-    
+
     private func setupConversationLogging() {
+        let logDir = URL(fileURLWithPath: appConfig.conversationHistoryPath, isDirectory: true)
+        try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        
-        let logDir = URL(fileURLWithPath: "conversation_history", isDirectory: true, relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
-        try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
-        
         let filename = "conversation_\(formatter.string(from: Date())).log"
         let fileURL = logDir.appendingPathComponent(filename)
-        
-        // Create file and open handle for appending
+
         FileManager.default.createFile(atPath: fileURL.path, contents: nil)
         conversationLogFile = fileURL
         conversationLogHandle = try? FileHandle(forWritingTo: fileURL)
         conversationLogHandle?.seekToEndOfFile()
-        
-        logConversation("=== Conversation started at \(Date()) ===\n")
+
+        logConversation("=== Conversation started at \(Date()) ===")
         print("[LOG] Writing to: \(fileURL.path)")
     }
-    
+
     private func logConversation(_ text: String) {
         guard let handle = conversationLogHandle else { return }
         if let data = (text + "\n").data(using: .utf8) {
             try? handle.write(contentsOf: data)
         }
     }
-    
+
     private func logStateChange(_ newState: ConversationState) {
         logConversation("[\(timestamp())] STATE: \(newState.rawValue)")
     }
-    
+
     private func logMessage(_ msg: Message) {
         let roleStr = msg.role == .user ? "USER" : "ASSISTANT"
         logConversation("[\(timestamp())] \(roleStr): \(msg.text)")
     }
-    
+
     private func timestamp() -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss.SSS"
         return formatter.string(from: Date())
     }
-    
+
     // MARK: - AVSpeechSynthesizerDelegate
-    
+
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -124,22 +199,20 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             }
         }
     }
-    
+
     // MARK: - Model Loading
-    
+
     func loadModels() async {
         isLoading = true
-        loadingStatus = "Loading models from local path..."
+        loadingStatus = "Loading models..."
         errorMessage = nil
-        
+
+        if appConfig.backend == "opencode" {
+            await setupOpencodeBackend()
+        }
+
         do {
-            let possibleASRPaths = [
-                "../../../../../Qwen3-ASR-0.6B-MLX-4bit",
-                "/Users/hasee/source/personaplex-mlx-swift/Qwen3-ASR-0.6B-MLX-4bit"
-            ]
-            let asrPath = possibleASRPaths.first { FileManager.default.fileExists(atPath: $0) }
-                ?? "/Users/hasee/source/personaplex-mlx-swift/Qwen3-ASR-0.6B-MLX-4bit"
-            
+            let asrPath = appConfig.resolvedASRPath()
             loadingStatus = "Loading ASR model..."
             let asr = try await Qwen3ASRModel.fromPretrained(localPath: asrPath) { progress, status in
                 DispatchQueue.main.async {
@@ -147,14 +220,8 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                 }
             }
             asrModel = asr
-            
-            let possibleVADPaths = [
-                "../../../../../Silero-VAD-v5-MLX",
-                "/Users/hasee/source/personaplex-mlx-swift/Silero-VAD-v5-MLX"
-            ]
-            let vadPath = possibleVADPaths.first { FileManager.default.fileExists(atPath: $0) }
-                ?? "/Users/hasee/source/personaplex-mlx-swift/Silero-VAD-v5-MLX"
-            
+
+            let vadPath = appConfig.resolvedVADPath()
             loadingStatus = "Loading VAD model..."
             let vad = try await SileroVADModel.fromPretrained(localPath: vadPath) { progress, status in
                 DispatchQueue.main.async {
@@ -162,47 +229,61 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                 }
             }
             vadModel = vad
-            
+
             let vadConfig = VADConfig(
-                onset: 0.5, offset: 0.35,
-                minSpeechDuration: 0.25, minSilenceDuration: 1.0,
-                windowDuration: 0.032, stepRatio: 1.0
+                onset: appConfig.vad.onset,
+                offset: appConfig.vad.offset,
+                minSpeechDuration: appConfig.vad.minSpeechDuration,
+                minSilenceDuration: appConfig.vad.minSilenceDuration,
+                windowDuration: 0.032,
+                stepRatio: 1.0
             )
             let processor = StreamingVADProcessor(model: vad, config: vadConfig)
             recorder = AudioRecorder(targetSampleRate: 16000, vadProcessor: processor)
-            
+
             loadingStatus = "Ready"
-            debugInfo = "Models loaded"
+            debugInfo = "Models loaded (backend: \(appConfig.backend))"
         } catch {
             errorMessage = "Failed to load models: \(error.localizedDescription)"
             loadingStatus = nil
         }
         isLoading = false
     }
-    
+
+    private func setupOpencodeBackend() async {
+        let serverURL = appConfig.opencode.serverURL
+        if await !OpencodeClient.isServerRunning(serverURL) {
+            loadingStatus = "Starting opencode serve..."
+            opencodeServerProcess = OpencodeClient.startServer()
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            if await !OpencodeClient.isServerRunning(serverURL) {
+                loadingStatus = "Opencode server not available, will retry on first message"
+            }
+        }
+        opencodeClient = OpencodeClient(config: appConfig)
+    }
+
     // MARK: - Conversation Control
-    
+
     func startListening() {
-        // Don't start recording while system TTS is speaking
         if speechSynthesizer.isSpeaking {
-            print("[DEBUG] startListening deferred (TTS active)")
             Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 self?.startListening()
             }
             return
         }
-        
+
         conversationState = .listening
         logStateChange(.listening)
         errorMessage = nil
-        debugInfo = "Listening... (5s silence to send)"
-        
+        debugInfo = "Listening... (\(Int(appConfig.vad.silenceTimeout))s silence to send)"
+
         asrBuffer = []
         lastSpeechEndTime = nil
         silenceTimer?.invalidate()
         silenceTimer = nil
-        silenceTimerValue = silenceTimeout
+        silenceTimerValue = appConfig.vad.silenceTimeout
         pendingSentence = ""
         hasStartedSpeaking = false
         streamingComplete = false
@@ -210,110 +291,133 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         pendingAudio = []
         pendingSendTask?.cancel()
         pendingSendTask = nil
-        
-        recorder?.onSpeechEnded = { [weak self] in
-            Task { @MainActor [weak self] in
-                self?.onSpeechEnded()
+
+        maxRecordingTimer?.invalidate()
+        maxRecordingTimer = Timer.scheduledTimer(withTimeInterval: appConfig.vad.maxRecordingDuration, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.conversationState == .listening || self.conversationState == .waitingSilence else { return }
+                print("[Recorder] Max recording duration reached, forcing send")
+                self.pendingAudio = self.recorder?.stopRecording() ?? []
+                self.silenceTimer?.invalidate()
+                self.maxRecordingTimer?.invalidate()
+                await self.processAndSend()
             }
         }
-        
+
+        recorder?.onSpeechEnded = { [weak self] in
+            Task { @MainActor [weak self] in self?.onSpeechEnded() }
+        }
+
         recorder?.startRecording()
     }
-    
+
     func stopConversation() {
         logStateChange(.inactive)
         pendingSendTask?.cancel()
         pendingSendTask = nil
         pendingAudio = []
-        
+        llamaTask?.cancel()
+        llamaTask = nil
+        maxRecordingTimer?.invalidate()
+        maxRecordingTimer = nil
+
         speechSynthesizer.stopSpeaking(at: .immediate)
         streamingComplete = false
         pendingUtteranceCount = 0
-        
+
         recorder?.onSpeechEnded = nil
         _ = recorder?.stopRecording()
-        
+
         conversationState = .inactive
         debugInfo = "Stopped"
     }
-    
+
     func clearConversation() {
         messages = []
         debugInfo = ""
+        opencodeClient?.reset()
     }
-    
+
     // MARK: - Speech Events
-    
+
     private func onSpeechEnded() {
         guard conversationState == .listening else { return }
-        
+
         let now = Date()
         lastSpeechEndTime = now
         conversationState = .waitingSilence
-        
+
         pendingAudio = recorder?.stopRecording() ?? []
-        
+
         silenceTimer?.invalidate()
-        silenceTimerValue = silenceTimeout
-        
+        silenceTimerValue = appConfig.vad.silenceTimeout
+
+        let timeout = appConfig.vad.silenceTimeout
         pendingSendTask?.cancel()
         pendingSendTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(self!.silenceTimeout * 1_000_000_000))
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
             if Task.isCancelled { return }
             await self?.processAndSend()
         }
-        
+
         debugInfo = "Waiting for silence... \(Int(silenceTimerValue))s"
     }
-    
+
     private func processAndSend() async {
         guard !pendingAudio.isEmpty else {
             startListening()
             return
         }
-        
+
         pendingSendTask?.cancel()
         pendingSendTask = nil
         silenceTimer?.invalidate()
         silenceTimer = nil
-        
+        maxRecordingTimer?.invalidate()
+        maxRecordingTimer = nil
+
         debugInfo = "Sending after silence..."
         conversationState = .transcribing
-        
+
         let audio = pendingAudio
         pendingAudio = []
-        
+
         guard !audio.isEmpty, let asr = asrModel else {
             errorMessage = "No audio or ASR model."
             stopConversation()
             return
         }
-        
+
         let asrText = await Task {
             let audio16k = Self.downsample(audio, from: 16000, to: 16000)
             return asr.transcribe(audio: audio16k, sampleRate: 16000, language: "en")
         }.value
-        
+
         guard !asrText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             startListening()
             return
         }
-        
+
         messages.append(Message(role: .user, text: asrText))
         logMessage(messages.last!)
         debugInfo = "Transcribed: \(asrText)"
-        
-        await sendToLLM(asrText)
-    }
-    
-    // MARK: - LLM Streaming
-    
-    private func sendToLLM(_ prompt: String) async {
-        llamaTask = Task {
-            try await handleLLMResponse(prompt: prompt)
+
+        if appConfig.backend == "opencode" {
+            await sendToOpencode(asrText)
+        } else {
+            await sendToLLM(asrText)
         }
     }
-    
+
+    // MARK: - LLM Streaming (llamacpp)
+
+    private func sendToLLM(_ prompt: String) async {
+        llamaTask?.cancel()
+        llamaTask = Task { [weak self] in
+            try await self?.handleLLMResponse(prompt: prompt)
+        }
+    }
+
     private func handleLLMResponse(prompt: String) async throws {
         conversationState = .generating
         logStateChange(.generating)
@@ -323,52 +427,45 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         pendingSentence = ""
         streamingComplete = false
         pendingUtteranceCount = 0
-        
-        let systemPrompt = ["role": "system", "content": "You are a helpful assistant. After reasoning, provide a concise response. Output your reasoning in the reasoning block, then output the actual response content."]
-        
-        let history = messages.map { msg in
+
+        let systemPrompt = ["role": "system", "content": appConfig.llamacpp.systemPrompt]
+
+        let history = messages.prefix(max(0, messages.count - 1)).map { msg in
             ["role": msg.role == .user ? "user" : "assistant", "content": msg.text]
         }
         let userMessage = ["role": "user", "content": prompt]
         let allMessages = [systemPrompt] + history + [userMessage]
-        
+
         let requestBody: [String: Any] = [
             "model": "",
             "messages": allMessages,
-            "n_predict": 512,
+            "n_predict": appConfig.llamacpp.maxTokens,
             "stream": true
         ]
-        
-        let url = URL(string: "\(llamaServerURL)/v1/chat/completions")!
+
+        let url = URL(string: "\(appConfig.llamacpp.serverURL)/v1/chat/completions")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        
-        let body = try JSONSerialization.data(withJSONObject: requestBody)
-        request.httpBody = body
-        
+        request.timeoutInterval = 300
+        request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
+
         var assistantText = ""
         let startTime = Date()
-        
-        print("[LLM] Starting streaming request to \(llamaServerURL)")
-        
-        let session = URLSession.shared
-        let (bytes, response) = try await session.bytes(for: request)
-        
+
+        print("[LLM] Starting streaming request to \(appConfig.llamacpp.serverURL)")
+
+        let (bytes, response) = try await streamingSession.bytes(for: request)
         print("[LLM] Got response: \(response)")
-        
-        // Process SSE stream in real-time, line by line
+
         var lineBuffer = Data()
-        var lineCount = 0
         for try await byte in bytes {
+            if Task.isCancelled { break }
             lineBuffer.append(byte)
-            // Check if we have a complete line (ending with \n)
             if byte == UInt8(ascii: "\n") {
-                lineCount += 1
                 if let lineStr = String(data: lineBuffer, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
                    lineStr.hasPrefix("data: ") {
                     let jsonStr = String(lineStr.dropFirst(6))
-                    
                     if jsonStr != "[DONE]" {
                         if let jsonData = jsonStr.data(using: .utf8),
                            let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
@@ -378,10 +475,8 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                                let delta = firstChoice["delta"] as? [String: Any] {
                                 content = delta["content"] as? String
                             }
-                            
                             if let content = content, !content.isEmpty {
                                 assistantText += content
-                                // Process token in real-time on main actor
                                 await MainActor.run { [weak self] in
                                     self?.streamTTSToken(content)
                                 }
@@ -392,46 +487,100 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                 lineBuffer = Data()
             }
         }
-        
+
         let totalTime = Date().timeIntervalSince(startTime)
-        print("[LLM] Finished in \(totalTime)s, \(lineCount) lines, \(assistantText.count) chars")
-        
+        print("[LLM] Finished in \(totalTime)s, \(assistantText.count) chars")
+
         await MainActor.run {
             messages.append(Message(role: .assistant, text: assistantText))
             logMessage(messages.last!)
             isTyping = false
-            
-            // Speak any remaining pending text
+
             if !pendingSentence.isEmpty {
                 speakSentence(pendingSentence)
                 pendingSentence = ""
             }
-            
-            // Mark streaming complete - delegate will start listening when all utterances finish
+
             streamingComplete = true
-            // Edge case: no sentences were spoken (empty response)
             if pendingUtteranceCount == 0 {
                 streamingComplete = false
                 startListening()
             }
         }
     }
-    
+
+    // MARK: - Opencode Backend
+
+    private func sendToOpencode(_ text: String) async {
+        guard let client = opencodeClient else {
+            errorMessage = "Opencode client not initialized"
+            stopConversation()
+            return
+        }
+
+        conversationState = .generating
+        logStateChange(.generating)
+        isTyping = true
+        debugInfo = "Generating (opencode)..."
+        hasStartedSpeaking = false
+        pendingSentence = ""
+        streamingComplete = false
+        pendingUtteranceCount = 0
+
+        let startTime = Date()
+        var assistantText = ""
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            Task {
+                await client.sendMessage(text,
+                    providerID: appConfig.opencode.providerID,
+                    modelID: appConfig.opencode.modelID,
+                    agent: appConfig.opencode.agent,
+                    onDelta: { [weak self] delta in
+                        assistantText += delta
+                        Task { @MainActor in
+                            self?.streamTTSToken(delta)
+                        }
+                    },
+                    onComplete: { [weak self] in
+                        let totalTime = Date().timeIntervalSince(startTime)
+                        print("[Opencode] Finished in \(totalTime)s, \(assistantText.count) chars")
+                        Task { @MainActor in
+                            guard let self else { continuation.resume(); return }
+                            self.messages.append(Message(role: .assistant, text: assistantText))
+                            self.logMessage(self.messages.last!)
+                            self.isTyping = false
+
+                            if !self.pendingSentence.isEmpty {
+                                self.speakSentence(self.pendingSentence)
+                                self.pendingSentence = ""
+                            }
+
+                            self.streamingComplete = true
+                            if self.pendingUtteranceCount == 0 {
+                                self.streamingComplete = false
+                                self.startListening()
+                            }
+                            continuation.resume()
+                        }
+                    }
+                )
+            }
+        }
+    }
+
     // MARK: - Built-in TTS
-    
+
     private func streamTTSToken(_ token: String) {
         pendingSentence += token
-        
-        // Speak when we hit a sentence boundary
+
         let sentenceEnders = CharacterSet(charactersIn: ".!?。！？\n")
         if let lastChar = token.unicodeScalars.last, sentenceEnders.contains(lastChar) {
-            // Also check comma for very long sentences (> ~80 chars without break)
             if !pendingSentence.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 speakSentence(pendingSentence)
                 pendingSentence = ""
             }
         } else if pendingSentence.count > 80 {
-            // Force a break on long text without punctuation
             if let lastSpace = pendingSentence.lastIndex(of: " ") {
                 let sentence = String(pendingSentence[pendingSentence.startIndex..<lastSpace])
                 pendingSentence = String(pendingSentence[pendingSentence.index(after: lastSpace)...])
@@ -439,52 +588,51 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             }
         }
     }
-    
+
     private func speakSentence(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        
+
         if !hasStartedSpeaking {
             hasStartedSpeaking = true
             conversationState = .speaking
             logStateChange(.speaking)
             debugInfo = "Speaking..."
         }
-        
+
         print("[TTS] Speaking: \"\(trimmed.prefix(60))\"")
-        
         pendingUtteranceCount += 1
-        
-        // Pick voice based on detected language
+
         let language = detectLanguage(from: trimmed)
         let voiceLanguage = language == "chinese" ? "zh-CN" : "en-US"
-        
+
         let utterance = AVSpeechUtterance(string: trimmed)
         if let voice = AVSpeechSynthesisVoice(language: voiceLanguage) {
             utterance.voice = voice
         }
-        utterance.rate = AVSpeechUtteranceDefaultSpeechRate * 0.95
+        utterance.rate = AVSpeechUtteranceDefaultSpeechRate * ttsRate
         utterance.volume = 1.0
-        
+
         speechSynthesizer.speak(utterance)
     }
-    
+
     private func detectLanguage(from text: String) -> String {
         let chineseChars = text.unicodeScalars.filter { $0.value >= 0x4e00 && $0.value <= 0x9fff }
         return chineseChars.isEmpty ? "english" : "chinese"
     }
-    
+
     // MARK: - Test
-    
+
     func testTTS() {
         print("[TTS] Test: macOS built-in TTS")
         let utterance = AVSpeechUtterance(string: "Hello world, this is a test of the built-in speech synthesizer.")
         utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+        utterance.rate = AVSpeechUtteranceDefaultSpeechRate * ttsRate
         speechSynthesizer.speak(utterance)
     }
-    
+
     // MARK: - Audio Processing
-    
+
     private static func downsample(_ samples: [Float], from srcRate: Int, to dstRate: Int) -> [Float] {
         guard srcRate != dstRate, !samples.isEmpty else { return samples }
         let ratio = Double(srcRate) / Double(dstRate)
@@ -499,5 +647,16 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             result[i] = s0 + frac * (s1 - s0)
         }
         return result
+    }
+
+    // MARK: - Model Info
+
+    var backendDescription: String {
+        switch appConfig.backend {
+        case "opencode":
+            return "LLM: opencode (\(appConfig.opencode.providerID)/\(appConfig.opencode.modelID))"
+        default:
+            return "LLM: llama.cpp @ \(appConfig.llamacpp.serverURL)"
+        }
     }
 }
