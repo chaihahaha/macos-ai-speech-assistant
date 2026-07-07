@@ -16,7 +16,10 @@ let package = Package(
                 .product(name: "AudioCommon", package: "speech-swift"),
             ],
             path: "Sources",
-            exclude: ["LlamaStreamingDemo.entitlements", "Info.plist"]
+            exclude: ["LlamaStreamingDemo.entitlements", "Info.plist"],
+            linkerSettings: [
+                .linkedFramework("MediaPlayer"),
+            ]
         ),
     ]
 )
