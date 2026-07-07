@@ -47,12 +47,12 @@ struct AppConfig: Codable, Sendable {
 
     static func load() -> AppConfig {
         let configPaths: [String] = [
-            // 1. Config next to executable or in cwd
-            FileManager.default.currentDirectoryPath + "/config.json",
-            // 2. Config in source directory
+            // User config takes highest priority
             NSString(string: "~/.config/my-llama-speech-assistant/config.json").expandingTildeInPath,
-            // 3. Config in project source (build context)
+            // Local project config
             NSString(string: "~/source/my-llama-speech-assistant/config.json").expandingTildeInPath,
+            // Working directory config
+            FileManager.default.currentDirectoryPath + "/config.json",
         ]
 
         var loadedConfig: AppConfig?
@@ -94,7 +94,7 @@ struct AppConfig: Codable, Sendable {
             serverURL: "http://127.0.0.1:9999",
             providerID: "llama.cpp",
             modelID: "qwen3.6",
-            agent: "general",
+            agent: "build",
             directory: NSString(string: "~/source").expandingTildeInPath
         ),
         models: ModelsConfig(

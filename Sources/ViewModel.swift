@@ -62,16 +62,11 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private var pendingSendTask: Task<Void, Never>?
     private var maxRecordingTimer: Timer?
 
+    // Opencode response tracking
+    private var opencodeResponseText = ""
+
     // Media key controller
     private let mediaKeys = MediaKeyController()
-
-    // Shared URLSession for LLM streaming (avoids session leaks)
-    private lazy var streamingSession: URLSession = {
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 300
-        config.timeoutIntervalForResource = 600
-        return URLSession(configuration: config)
-    }()
 
     override init() {
         appConfig = AppConfig.load()
@@ -80,6 +75,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         speechSynthesizer.delegate = self
         setupConversationLogging()
         setupMediaKeys()
+        print("[ViewModel] Backend: \(appConfig.backend), opencode URL: \(appConfig.opencode.serverURL)")
     }
 
     // MARK: - Media Key Setup
@@ -87,8 +83,8 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private func setupMediaKeys() {
         mediaKeys.setHandlers(
             playPause: { [weak self] in self?.toggleTTSSpeed() },
-            nextTrack: { [weak self] in self?.interruptConversation() },
-            previousTrack: { [weak self] in self?.repeatLastResponse() }
+            nextTrack: { [weak self] in self?.handleNextTrack() },
+            previousTrack: { [weak self] in self?.handlePreviousTrack() }
         )
         mediaKeys.becomeNowPlaying()
     }
@@ -105,19 +101,73 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     private func toggleTTSSpeed() {
-        if ttsRate == appConfig.tts.slowRate {
+        let oldRate = ttsRate
+        if ttsRate <= appConfig.tts.slowRate + 0.05 {
             ttsRate = appConfig.tts.fastRate
-            debugInfo = "TTS: fast mode"
+            debugInfo = "TTS: fast (\(String(format: "%.1f", ttsRate))x)"
         } else {
             ttsRate = appConfig.tts.slowRate
-            debugInfo = "TTS: slow mode"
+            debugInfo = "TTS: slow (\(String(format: "%.1f", ttsRate))x)"
         }
-        print("[MediaKey] TTS rate: \(ttsRate)")
+        print("[MediaKey] TTS rate: \(oldRate) -> \(ttsRate)")
+
+        // Re-speak current sentence at new rate if TTS is active
+        if speechSynthesizer.isSpeaking || hasStartedSpeaking {
+            let current = pendingSentence
+            speechSynthesizer.stopSpeaking(at: .immediate)
+            pendingUtteranceCount = 0
+            hasStartedSpeaking = false
+            if !current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                speakSentence(current)
+            }
+        }
+    }
+
+    private func handleNextTrack() {
+        print("[MediaKey] handleNextTrack called, state=\(conversationState)")
+        if conversationState == .inactive {
+            undoLastConversation()
+        } else {
+            interruptConversation()
+        }
+    }
+
+    private func handlePreviousTrack() {
+        print("[MediaKey] handlePreviousTrack called, state=\(conversationState), msgs=\(messages.count)")
+        guard let lastResponse = messages.last(where: { $0.role == .assistant }) else {
+            print("[MediaKey] No assistant message to repeat")
+            return
+        }
+
+        stopConversation()
+        speechSynthesizer.stopSpeaking(at: .immediate)
+
+        // Ensure TTS finishes speaking before setting up resume
+        // Use a small delay to let AVFoundation settle
+        debugInfo = "Repeating last response..."
+        hasStartedSpeaking = false
+        pendingUtteranceCount = 0
+        streamingComplete = true
+        pendingSentence = ""
+
+        print("[MediaKey] Speaking: \"\(lastResponse.text.prefix(40))...\"")
+        speakSentence(lastResponse.text)
+    }
+
+    private func undoLastConversation() {
+        print("[MediaKey] Undoing last conversation")
+        guard let lastUser = messages.lastIndex(where: { $0.role == .user }) else { return }
+        messages.removeSubrange(lastUser...)
+        opencodeClient?.reset()
+        debugInfo = "Undone. Restarting listening..."
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            self?.startListening()
+        }
     }
 
     private func interruptConversation() {
         print("[MediaKey] Interrupting conversation")
-        guard conversationState != .inactive else { return }
         speechSynthesizer.stopSpeaking(at: .immediate)
         pendingUtteranceCount = 0
         streamingComplete = false
@@ -133,13 +183,11 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             }
         }
         stopConversation()
-        debugInfo = "Interrupted"
-    }
-
-    private func repeatLastResponse() {
-        guard let lastResponse = messages.last(where: { $0.role == .assistant }) else { return }
-        print("[MediaKey] Repeating last response")
-        speakSentence(lastResponse.text)
+        debugInfo = "Interrupted. Restarting listening..."
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            self?.startListening()
+        }
     }
 
     // MARK: - Conversation Logging
@@ -335,6 +383,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     func clearConversation() {
         messages = []
         debugInfo = ""
+        isTyping = false
         opencodeClient?.reset()
     }
 
@@ -369,7 +418,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             return
         }
 
-        pendingSendTask?.cancel()
+        // Clear the pending send reference (don't cancel — we ARE that task)
         pendingSendTask = nil
         silenceTimer?.invalidate()
         silenceTimer = nil
@@ -381,6 +430,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         let audio = pendingAudio
         pendingAudio = []
+        asrBuffer = []
 
         guard !audio.isEmpty, let asr = asrModel else {
             errorMessage = "No audio or ASR model."
@@ -392,6 +442,9 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             let audio16k = Self.downsample(audio, from: 16000, to: 16000)
             return asr.transcribe(audio: audio16k, sampleRate: 16000, language: "en")
         }.value
+
+        // Clear recorder's internal buffer after ASR
+        _ = recorder?.stopRecording()
 
         guard !asrText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             startListening()
@@ -455,7 +508,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         print("[LLM] Starting streaming request to \(appConfig.llamacpp.serverURL)")
 
-        let (bytes, response) = try await streamingSession.bytes(for: request)
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
         print("[LLM] Got response: \(response)")
 
         var lineBuffer = Data()
@@ -526,47 +579,43 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         pendingSentence = ""
         streamingComplete = false
         pendingUtteranceCount = 0
+        opencodeResponseText = ""
 
         let startTime = Date()
-        var assistantText = ""
 
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            Task {
-                await client.sendMessage(text,
-                    providerID: appConfig.opencode.providerID,
-                    modelID: appConfig.opencode.modelID,
-                    agent: appConfig.opencode.agent,
-                    onDelta: { [weak self] delta in
-                        assistantText += delta
-                        Task { @MainActor in
-                            self?.streamTTSToken(delta)
-                        }
-                    },
-                    onComplete: { [weak self] in
-                        let totalTime = Date().timeIntervalSince(startTime)
-                        print("[Opencode] Finished in \(totalTime)s, \(assistantText.count) chars")
-                        Task { @MainActor in
-                            guard let self else { continuation.resume(); return }
-                            self.messages.append(Message(role: .assistant, text: assistantText))
-                            self.logMessage(self.messages.last!)
-                            self.isTyping = false
+        await client.sendMessage(text,
+            onDelta: { [weak self] delta in
+                Task { @MainActor [weak self] in
+                    self?.opencodeResponseText += delta
+                    self?.streamTTSToken(delta)
+                }
+            },
+            onComplete: { [weak self] in
+                let totalTime = Date().timeIntervalSince(startTime)
+                print("[Opencode] Finished in \(totalTime)s")
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.isTyping = false
 
-                            if !self.pendingSentence.isEmpty {
-                                self.speakSentence(self.pendingSentence)
-                                self.pendingSentence = ""
-                            }
-
-                            self.streamingComplete = true
-                            if self.pendingUtteranceCount == 0 {
-                                self.streamingComplete = false
-                                self.startListening()
-                            }
-                            continuation.resume()
-                        }
+                    if !self.opencodeResponseText.isEmpty {
+                        self.messages.append(Message(role: .assistant, text: self.opencodeResponseText))
+                        self.logMessage(self.messages.last!)
+                        self.opencodeResponseText = ""
                     }
-                )
+
+                    if !self.pendingSentence.isEmpty {
+                        self.speakSentence(self.pendingSentence)
+                        self.pendingSentence = ""
+                    }
+
+                    self.streamingComplete = true
+                    if self.pendingUtteranceCount == 0 {
+                        self.streamingComplete = false
+                        self.startListening()
+                    }
+                }
             }
-        }
+        )
     }
 
     // MARK: - Built-in TTS

@@ -9,7 +9,7 @@
     "serverURL": "http://127.0.0.1:9999",
     "providerID": "llama.cpp",
     "modelID": "qwen3.6",
-    "agent": "general",
+    "agent": "build",
     "directory": "/Users/hasee/source"
   },
   "models": {
