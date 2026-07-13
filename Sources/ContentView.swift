@@ -3,6 +3,7 @@ import Foundation
 
 struct ContentView: View {
     @StateObject private var viewModel = ViewModel()
+    @State private var sessIDInput: String = ""
 
     var body: some View {
         VStack {
@@ -40,6 +41,35 @@ struct ContentView: View {
                 .padding(.vertical, 4)
                 .background(Color.blue.opacity(0.1))
             }
+
+            HStack(spacing: 6) {
+                Text("Session:")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                if let sid = viewModel.currentSessID {
+                    HStack(spacing: 4) {
+                        Text(sid.prefix(16) + "...")
+                            .font(.caption)
+                            .foregroundColor(.green)
+                            .lineLimit(1)
+                        Button(action: { viewModel.currentSessID = nil }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } else {
+                    TextField("sess_id (optional)", text: $sessIDInput)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                        .frame(maxWidth: 200)
+                    Button("Set") { viewModel.setSessID(sessIDInput) }
+                        .font(.caption)
+                        .controlSize(.small)
+                }
+            }
+            .padding(.horizontal)
 
             HStack {
                 Text("ASR: Qwen3-ASR-0.6B-MLX-4bit (local)")

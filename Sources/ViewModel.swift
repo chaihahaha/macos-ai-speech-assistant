@@ -25,6 +25,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @Published var debugInfo: String = ""
     @Published var isTyping = false
     @Published var silenceTimerValue: Double = 5.0
+    @Published var currentSessID: String? = nil
 
     // MARK: - Private
 
@@ -314,6 +315,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     // MARK: - Conversation Control
 
     func startListening() {
+        print("[ViewModel] startListening: state=\(conversationState.rawValue), recorder=\(recorder != nil ? "present" : "NIL"), hasClient=\(opencodeClient != nil)")
         if speechSynthesizer.isSpeaking {
             Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 500_000_000)
@@ -344,8 +346,9 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         maxRecordingTimer = Timer.scheduledTimer(withTimeInterval: appConfig.vad.maxRecordingDuration, repeats: false) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.conversationState == .listening || self.conversationState == .waitingSilence else { return }
-                print("[Recorder] Max recording duration reached, forcing send")
+                print("[Recorder] Max recording duration reached, forcing send (recorder=\(self.recorder != nil ? "present" : "NIL"))")
                 self.pendingAudio = self.recorder?.stopRecording() ?? []
+                print("[Recorder] stopRecording returned \(self.pendingAudio.count) samples")
                 self.silenceTimer?.invalidate()
                 self.maxRecordingTimer?.invalidate()
                 await self.processAndSend()
@@ -360,6 +363,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     func stopConversation() {
+        print("[ViewModel] stopConversation called, state=\(conversationState.rawValue)")
         logStateChange(.inactive)
         pendingSendTask?.cancel()
         pendingSendTask = nil
@@ -385,6 +389,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         debugInfo = ""
         isTyping = false
         opencodeClient?.reset()
+        currentSessID = nil
     }
 
     // MARK: - Speech Events
@@ -413,12 +418,13 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     private func processAndSend() async {
+        print("[ViewModel] processAndSend: pendingAudio.count=\(pendingAudio.count), recorder=\(recorder != nil ? "present" : "NIL")")
         guard !pendingAudio.isEmpty else {
+            print("[ViewModel] processAndSend: pendingAudio empty, restarting listening")
             startListening()
             return
         }
 
-        // Clear the pending send reference (don't cancel — we ARE that task)
         pendingSendTask = nil
         silenceTimer?.invalidate()
         silenceTimer = nil
@@ -427,6 +433,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         debugInfo = "Sending after silence..."
         conversationState = .transcribing
+        print("[ViewModel] processAndSend: transcribing \(pendingAudio.count) samples")
 
         let audio = pendingAudio
         pendingAudio = []
@@ -434,6 +441,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         guard !audio.isEmpty, let asr = asrModel else {
             errorMessage = "No audio or ASR model."
+            print("[ViewModel] processAndSend: audio empty=\(audio.isEmpty), asrModel=\(asrModel != nil ? "present" : "NIL")")
             stopConversation()
             return
         }
@@ -563,6 +571,22 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     // MARK: - Opencode Backend
+
+    func setSessID(_ id: String) {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard let client = opencodeClient else {
+            print("[ViewModel] setSessID: opencodeClient is nil, creating new client")
+            opencodeClient = OpencodeClient(config: appConfig)
+            opencodeClient?.setSessionID(trimmed)
+            currentSessID = trimmed
+            debugInfo = "Session ID set: \(trimmed.prefix(12))..."
+            return
+        }
+        client.setSessionID(trimmed)
+        currentSessID = trimmed
+        debugInfo = "Session ID set: \(trimmed.prefix(12))..."
+    }
 
     private func sendToOpencode(_ text: String) async {
         guard let client = opencodeClient else {

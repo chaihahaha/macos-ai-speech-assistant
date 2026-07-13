@@ -20,6 +20,11 @@ final class OpencodeClient {
         self.agent = config.opencode.agent
     }
 
+    func setSessionID(_ id: String) {
+        sessionID = id
+        print("[Opencode] Using existing session: \(id)")
+    }
+
     func ensureSession() async throws {
         if sessionID != nil { return }
 
