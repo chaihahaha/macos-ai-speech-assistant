@@ -8,6 +8,7 @@ final class MediaKeyController {
     private var onNextTrack: (() -> Void)?
     private var onPreviousTrack: (() -> Void)?
     private var eventMonitor: Any?
+    private var keepAliveTimer: Timer?
 
     init() {
         setupRemoteCommands()
@@ -37,18 +38,45 @@ final class MediaKeyController {
             info[MPMediaItemPropertyArtwork] = artwork
         }
 
-        print("[MediaKeys] Setting Now Playing info")
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        MPNowPlayingInfoCenter.default().playbackState = .playing
+        print("[MediaKeys] Now Playing activated, playbackState=.playing")
 
-        // Must set playbackState AFTER nowPlayingInfo
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            MPNowPlayingInfoCenter.default().playbackState = .playing
-            print("[MediaKeys] Now Playing activated, playbackState=.playing")
+        keepAliveTimer?.invalidate()
+        keepAliveTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.pingNowPlaying() }
         }
     }
 
+    private func pingNowPlaying() {
+        let center = MPNowPlayingInfoCenter.default()
+        if var info = center.nowPlayingInfo {
+            let t = info[MPNowPlayingInfoPropertyElapsedPlaybackTime] as? Double ?? 0
+            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = t + 2.0
+            info[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
+            center.nowPlayingInfo = info
+        }
+    }
+
+    func refreshNowPlaying() {
+        MPNowPlayingInfoCenter.default().playbackState = .playing
+        if var info = MPNowPlayingInfoCenter.default().nowPlayingInfo {
+            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = 0.0
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        }
+    }
+
+    func setPaused() {
+        MPNowPlayingInfoCenter.default().playbackState = .paused
+    }
+
+    func setPlaying() {
+        MPNowPlayingInfoCenter.default().playbackState = .playing
+    }
+
     func resignNowPlaying() {
-        print("[MediaKeys] Resigning Now Playing")
+        keepAliveTimer?.invalidate()
+        keepAliveTimer = nil
         MPNowPlayingInfoCenter.default().playbackState = .stopped
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
     }
@@ -57,40 +85,26 @@ final class MediaKeyController {
         let center = MPRemoteCommandCenter.shared()
 
         center.playCommand.addTarget { [weak self] _ in
-            Task { @MainActor [weak self] in
-                print("[MediaKeys] MPRemote: play")
-                self?.onPlayPause?()
-            }
+            self?.dispatchOnMainActor { $0.onPlayPause?() }
             return .success
         }
         center.pauseCommand.addTarget { [weak self] _ in
-            Task { @MainActor [weak self] in
-                print("[MediaKeys] MPRemote: pause")
-                self?.onPlayPause?()
-            }
+            self?.dispatchOnMainActor { $0.onPlayPause?() }
             return .success
         }
         center.togglePlayPauseCommand.addTarget { [weak self] _ in
-            Task { @MainActor [weak self] in
-                print("[MediaKeys] MPRemote: togglePlayPause")
-                self?.onPlayPause?()
-            }
+            self?.dispatchOnMainActor { $0.onPlayPause?() }
             return .success
         }
 
         center.nextTrackCommand.addTarget { [weak self] _ in
-            Task { @MainActor [weak self] in
-                print("[MediaKeys] MPRemote: nextTrack")
-                self?.onNextTrack?()
-            }
+            print("[MediaKeys] MPRemote: nextTrack")
+            self?.dispatchOnMainActor { $0.onNextTrack?() }
             return .success
         }
 
         center.previousTrackCommand.addTarget { [weak self] _ in
-            Task { @MainActor [weak self] in
-                print("[MediaKeys] MPRemote: previousTrack")
-                self?.onPreviousTrack?()
-            }
+            self?.dispatchOnMainActor { $0.onPreviousTrack?() }
             return .success
         }
 
@@ -101,6 +115,13 @@ final class MediaKeyController {
         center.previousTrackCommand.isEnabled = true
 
         print("[MediaKeys] MPRemoteCommandCenter configured")
+    }
+
+    private func dispatchOnMainActor(_ block: @escaping (MediaKeyController) -> Void) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            block(self)
+        }
     }
 
     // MARK: - Fallback: Global Event Monitor for media keys
@@ -126,17 +147,18 @@ final class MediaKeyController {
         let NX_KEYTYPE_NEXT: Int = 17
         let NX_KEYTYPE_PREVIOUS: Int = 18
 
-        Task { @MainActor [weak self] in
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
             switch keyCode {
             case NX_KEYTYPE_PLAY:
                 print("[MediaKeys] NSEvent: play/pause")
-                self?.onPlayPause?()
+                self.onPlayPause?()
             case NX_KEYTYPE_NEXT:
                 print("[MediaKeys] NSEvent: nextTrack")
-                self?.onNextTrack?()
+                self.onNextTrack?()
             case NX_KEYTYPE_PREVIOUS:
                 print("[MediaKeys] NSEvent: previousTrack")
-                self?.onPreviousTrack?()
+                self.onPreviousTrack?()
             default:
                 break
             }
@@ -144,11 +166,10 @@ final class MediaKeyController {
     }
 
     deinit {
+        keepAliveTimer?.invalidate()
         if let monitor = eventMonitor {
             NSEvent.removeMonitor(monitor)
-            print("[MediaKeys] Event monitor removed")
         }
-
         let center = MPRemoteCommandCenter.shared()
         center.playCommand.removeTarget(nil)
         center.pauseCommand.removeTarget(nil)

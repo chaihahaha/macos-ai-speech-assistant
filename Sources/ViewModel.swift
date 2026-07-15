@@ -6,8 +6,6 @@ import AudioCommon
 
 @MainActor
 final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
-    // MARK: - State
-
     enum ConversationState: String {
         case inactive
         case listening
@@ -27,35 +25,33 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @Published var silenceTimerValue: Double = 5.0
     @Published var currentSessID: String? = nil
 
-    // MARK: - Private
+    @Published var selectedBackend: String = "opencode"
+    @Published var llamacppURL: String = "http://127.0.0.1:8080"
+    @Published var opencodeURL: String = "http://127.0.0.1:9999"
+    @Published var opencodeProviderID: String = "llama.cpp"
+    @Published var opencodeModelID: String = "qwen3.6"
+    @Published var opencodeAgent: String = "build"
+    @Published var opencodeDirectory: String = "~/source"
 
     private var asrModel: Qwen3ASRModel?
     private var vadModel: SileroVADModel?
     private var recorder: AudioRecorder?
-    private var conversationTask: Task<Void, Never>?
     private var llamaTask: Task<Void, Error>?
-    private var asrTask: Task<String, Error>?
     private var opencodeClient: OpencodeClient?
     private var opencodeServerProcess: Process?
 
-    // Config
     private let appConfig: AppConfig
     private var ttsRate: Float
 
-    // Built-in macOS TTS
     private let speechSynthesizer = AVSpeechSynthesizer()
     private var pendingSentence: String = ""
     private var hasStartedSpeaking = false
-
-    // TTS utterance tracking
     private var pendingUtteranceCount = 0
     private var streamingComplete = false
 
-    // Conversation logging
     private var conversationLogFile: URL?
     private var conversationLogHandle: FileHandle?
 
-    // ASR buffer for silence-based sending
     private var asrBuffer: [Float] = []
     private var pendingAudio: [Float] = []
     private var lastSpeechEndTime: Date?
@@ -63,29 +59,34 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private var pendingSendTask: Task<Void, Never>?
     private var maxRecordingTimer: Timer?
 
-    // Opencode response tracking
     private var opencodeResponseText = ""
 
-    // Media key controller
     private let mediaKeys = MediaKeyController()
 
     override init() {
         appConfig = AppConfig.load()
         ttsRate = appConfig.tts.rate
+
+        selectedBackend = appConfig.backend
+        llamacppURL = appConfig.llamacpp.serverURL
+        opencodeURL = appConfig.opencode.serverURL
+        opencodeProviderID = appConfig.opencode.providerID
+        opencodeModelID = appConfig.opencode.modelID
+        opencodeAgent = appConfig.opencode.agent
+        opencodeDirectory = appConfig.opencode.directory
+
         super.init()
         speechSynthesizer.delegate = self
         setupConversationLogging()
         setupMediaKeys()
-        print("[ViewModel] Backend: \(appConfig.backend), opencode URL: \(appConfig.opencode.serverURL)")
+        print("[ViewModel] Backend: \(appConfig.backend)")
     }
-
-    // MARK: - Media Key Setup
 
     private func setupMediaKeys() {
         mediaKeys.setHandlers(
             playPause: { [weak self] in self?.toggleTTSSpeed() },
             nextTrack: { [weak self] in self?.handleNextTrack() },
-            previousTrack: { [weak self] in self?.handlePreviousTrack() }
+            previousTrack: { }
         )
         mediaKeys.becomeNowPlaying()
     }
@@ -101,18 +102,26 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         try? conversationLogHandle?.close()
     }
 
+    func applyBackendSettings() {
+        llamacppURL = llamacppURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        opencodeURL = opencodeURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        opencodeDirectory = opencodeDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        opencodeClient?.reset()
+        opencodeClient = nil
+        currentSessID = nil
+        debugInfo = "Backend settings applied"
+    }
+
     private func toggleTTSSpeed() {
-        let oldRate = ttsRate
         if ttsRate <= appConfig.tts.slowRate + 0.05 {
-            ttsRate = appConfig.tts.fastRate
-            debugInfo = "TTS: fast (\(String(format: "%.1f", ttsRate))x)"
+            ttsRate = 2.0
+            debugInfo = "TTS: fast (2.0x)"
         } else {
             ttsRate = appConfig.tts.slowRate
             debugInfo = "TTS: slow (\(String(format: "%.1f", ttsRate))x)"
         }
-        print("[MediaKey] TTS rate: \(oldRate) -> \(ttsRate)")
+        print("[MediaKey] TTS rate: \(ttsRate)")
 
-        // Re-speak current sentence at new rate if TTS is active
         if speechSynthesizer.isSpeaking || hasStartedSpeaking {
             let current = pendingSentence
             speechSynthesizer.stopSpeaking(at: .immediate)
@@ -125,39 +134,26 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     private func handleNextTrack() {
-        print("[MediaKey] handleNextTrack called, state=\(conversationState)")
-        if conversationState == .inactive {
-            undoLastConversation()
-        } else {
+        print("[MediaKey] handleNextTrack, state=\(conversationState.rawValue), msgCount=\(messages.count)")
+        switch conversationState {
+        case .generating, .speaking:
             interruptConversation()
+        case .listening, .waitingSilence:
+            undoLastConversation()
+        case .inactive, .transcribing:
+            startListening()
         }
-    }
-
-    private func handlePreviousTrack() {
-        print("[MediaKey] handlePreviousTrack called, state=\(conversationState), msgs=\(messages.count)")
-        guard let lastResponse = messages.last(where: { $0.role == .assistant }) else {
-            print("[MediaKey] No assistant message to repeat")
-            return
-        }
-
-        stopConversation()
-        speechSynthesizer.stopSpeaking(at: .immediate)
-
-        // Ensure TTS finishes speaking before setting up resume
-        // Use a small delay to let AVFoundation settle
-        debugInfo = "Repeating last response..."
-        hasStartedSpeaking = false
-        pendingUtteranceCount = 0
-        streamingComplete = true
-        pendingSentence = ""
-
-        print("[MediaKey] Speaking: \"\(lastResponse.text.prefix(40))...\"")
-        speakSentence(lastResponse.text)
     }
 
     private func undoLastConversation() {
         print("[MediaKey] Undoing last conversation")
-        guard let lastUser = messages.lastIndex(where: { $0.role == .user }) else { return }
+        if conversationState != .inactive {
+            stopConversation()
+        }
+        guard let lastUser = messages.lastIndex(where: { $0.role == .user }) else {
+            startListening()
+            return
+        }
         messages.removeSubrange(lastUser...)
         opencodeClient?.reset()
         debugInfo = "Undone. Restarting listening..."
@@ -176,7 +172,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         llamaTask?.cancel()
         llamaTask = nil
-        Task { await opencodeClient?.abort() }
+        Task { await opencodeClient?.interrupt() }
 
         if let lastUserMsg = messages.last(where: { $0.role == .user }) {
             messages.removeAll { msg in
@@ -190,8 +186,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             self?.startListening()
         }
     }
-
-    // MARK: - Conversation Logging
 
     private func setupConversationLogging() {
         let logDir = URL(fileURLWithPath: appConfig.conversationHistoryPath, isDirectory: true)
@@ -234,31 +228,26 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         return formatter.string(from: Date())
     }
 
-    // MARK: - AVSpeechSynthesizerDelegate
-
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
         Task { @MainActor [weak self] in
             guard let self else { return }
             pendingUtteranceCount = max(0, pendingUtteranceCount - 1)
             if streamingComplete && pendingUtteranceCount == 0 {
-                print("[TTS] All utterances finished, resuming listening")
+                print("[TTS] All utterances finished, waiting before resuming listening")
                 streamingComplete = false
-                try? await Task.sleep(nanoseconds: 500_000_000)
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                while speechSynthesizer.isSpeaking {
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                }
                 startListening()
             }
         }
     }
 
-    // MARK: - Model Loading
-
     func loadModels() async {
         isLoading = true
         loadingStatus = "Loading models..."
         errorMessage = nil
-
-        if appConfig.backend == "opencode" {
-            await setupOpencodeBackend()
-        }
 
         do {
             let asrPath = appConfig.resolvedASRPath()
@@ -291,7 +280,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             recorder = AudioRecorder(targetSampleRate: 16000, vadProcessor: processor)
 
             loadingStatus = "Ready"
-            debugInfo = "Models loaded (backend: \(appConfig.backend))"
+            debugInfo = "Models loaded (backend: \(selectedBackend))"
         } catch {
             errorMessage = "Failed to load models: \(error.localizedDescription)"
             loadingStatus = nil
@@ -299,23 +288,40 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         isLoading = false
     }
 
-    private func setupOpencodeBackend() async {
-        let serverURL = appConfig.opencode.serverURL
-        if await !OpencodeClient.isServerRunning(serverURL) {
-            loadingStatus = "Starting opencode serve..."
-            opencodeServerProcess = OpencodeClient.startServer()
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-            if await !OpencodeClient.isServerRunning(serverURL) {
-                loadingStatus = "Opencode server not available, will retry on first message"
-            }
+    private func ensureBackendClient() {
+        if selectedBackend == "opencode", opencodeClient == nil {
+            opencodeClient = OpencodeClient(
+                baseURL: opencodeURL,
+                directory: opencodeDirectory,
+                providerID: opencodeProviderID,
+                modelID: opencodeModelID,
+                agent: opencodeAgent
+            )
         }
-        opencodeClient = OpencodeClient(config: appConfig)
     }
 
-    // MARK: - Conversation Control
+    private func ensureOpencodeServer() async {
+        if await OpencodeClient.isServerRunning(opencodeURL) { return }
+        loadingStatus = "Starting opencode serve..."
+        debugInfo = "Starting opencode serve on \(opencodeURL)..."
+        guard let url = URL(string: opencodeURL),
+              let host = url.host,
+              let port = url.port else {
+            loadingStatus = "Invalid opencode URL"
+            return
+        }
+        opencodeServerProcess = OpencodeClient.startServer(hostname: host, port: port)
+        try? await Task.sleep(nanoseconds: 3_000_000_000)
+        if await !OpencodeClient.isServerRunning(opencodeURL) {
+            loadingStatus = "Opencode server not available"
+            debugInfo = "Failed to start opencode serve"
+        } else {
+            loadingStatus = "Opencode serve started"
+            debugInfo = "Opencode serve started on \(opencodeURL)"
+        }
+    }
 
     func startListening() {
-        print("[ViewModel] startListening: state=\(conversationState.rawValue), recorder=\(recorder != nil ? "present" : "NIL"), hasClient=\(opencodeClient != nil)")
         if speechSynthesizer.isSpeaking {
             Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 500_000_000)
@@ -323,6 +329,8 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             }
             return
         }
+
+        ensureBackendClient()
 
         conversationState = .listening
         logStateChange(.listening)
@@ -346,9 +354,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         maxRecordingTimer = Timer.scheduledTimer(withTimeInterval: appConfig.vad.maxRecordingDuration, repeats: false) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.conversationState == .listening || self.conversationState == .waitingSilence else { return }
-                print("[Recorder] Max recording duration reached, forcing send (recorder=\(self.recorder != nil ? "present" : "NIL"))")
                 self.pendingAudio = self.recorder?.stopRecording() ?? []
-                print("[Recorder] stopRecording returned \(self.pendingAudio.count) samples")
                 self.silenceTimer?.invalidate()
                 self.maxRecordingTimer?.invalidate()
                 await self.processAndSend()
@@ -363,7 +369,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     func stopConversation() {
-        print("[ViewModel] stopConversation called, state=\(conversationState.rawValue)")
         logStateChange(.inactive)
         pendingSendTask?.cancel()
         pendingSendTask = nil
@@ -392,13 +397,10 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         currentSessID = nil
     }
 
-    // MARK: - Speech Events
-
     private func onSpeechEnded() {
         guard conversationState == .listening else { return }
 
-        let now = Date()
-        lastSpeechEndTime = now
+        lastSpeechEndTime = Date()
         conversationState = .waitingSilence
 
         pendingAudio = recorder?.stopRecording() ?? []
@@ -418,10 +420,9 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     private func processAndSend() async {
-        print("[ViewModel] processAndSend: pendingAudio.count=\(pendingAudio.count), recorder=\(recorder != nil ? "present" : "NIL")")
         guard !pendingAudio.isEmpty else {
-            print("[ViewModel] processAndSend: pendingAudio empty, restarting listening")
-            startListening()
+            stopConversation()
+            debugInfo = "Auto-stopped: no speech detected"
             return
         }
 
@@ -433,7 +434,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         debugInfo = "Sending after silence..."
         conversationState = .transcribing
-        print("[ViewModel] processAndSend: transcribing \(pendingAudio.count) samples")
 
         let audio = pendingAudio
         pendingAudio = []
@@ -441,7 +441,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         guard !audio.isEmpty, let asr = asrModel else {
             errorMessage = "No audio or ASR model."
-            print("[ViewModel] processAndSend: audio empty=\(audio.isEmpty), asrModel=\(asrModel != nil ? "present" : "NIL")")
             stopConversation()
             return
         }
@@ -451,26 +450,42 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             return asr.transcribe(audio: audio16k, sampleRate: 16000, language: "en")
         }.value
 
-        // Clear recorder's internal buffer after ASR
         _ = recorder?.stopRecording()
 
-        guard !asrText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            startListening()
+        let trimmed = asrText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            stopConversation()
+            debugInfo = "Auto-stopped: empty ASR"
             return
         }
 
-        messages.append(Message(role: .user, text: asrText))
-        logMessage(messages.last!)
-        debugInfo = "Transcribed: \(asrText)"
+        guard isValidSpeech(trimmed) else {
+            stopConversation()
+            debugInfo = "Auto-stopped: noise filtered"
+            return
+        }
 
-        if appConfig.backend == "opencode" {
-            await sendToOpencode(asrText)
+        messages.append(Message(role: .user, text: trimmed))
+        logMessage(messages.last!)
+        debugInfo = "Transcribed: \(trimmed)"
+
+        if selectedBackend == "opencode" {
+            await sendToOpencode(trimmed)
         } else {
-            await sendToLLM(asrText)
+            await sendToLLM(trimmed)
         }
     }
 
-    // MARK: - LLM Streaming (llamacpp)
+    private func isValidSpeech(_ text: String) -> Bool {
+        if text.count < 5 { return false }
+        let noiseWords: Set<String> = ["the", "a", "an", "um", "umm", "emm", "ah", "oh", "uh", "er", "hmm", "huh", "eh", "ha", "mm", "mhm"]
+        let words = text.lowercased().split(separator: " ")
+        if words.count <= 2 {
+            let contentWords = words.filter { !noiseWords.contains(String($0)) }
+            if contentWords.isEmpty { return false }
+        }
+        return true
+    }
 
     private func sendToLLM(_ prompt: String) async {
         llamaTask?.cancel()
@@ -483,7 +498,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         conversationState = .generating
         logStateChange(.generating)
         isTyping = true
-        debugInfo = "Generating..."
+        debugInfo = "Generating (llama.cpp)..."
         hasStartedSpeaking = false
         pendingSentence = ""
         streamingComplete = false
@@ -504,7 +519,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             "stream": true
         ]
 
-        let url = URL(string: "\(appConfig.llamacpp.serverURL)/v1/chat/completions")!
+        let url = URL(string: "\(llamacppURL)/v1/chat/completions")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -514,7 +529,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         var assistantText = ""
         let startTime = Date()
 
-        print("[LLM] Starting streaming request to \(appConfig.llamacpp.serverURL)")
+        print("[LLM] Starting streaming request to \(llamacppURL)")
 
         let (bytes, response) = try await URLSession.shared.bytes(for: request)
         print("[LLM] Got response: \(response)")
@@ -564,31 +579,42 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
             streamingComplete = true
             if pendingUtteranceCount == 0 {
-                streamingComplete = false
-                startListening()
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    while self.speechSynthesizer.isSpeaking {
+                        try? await Task.sleep(nanoseconds: 200_000_000)
+                    }
+                    self.streamingComplete = false
+                    self.startListening()
+                }
             }
         }
     }
 
-    // MARK: - Opencode Backend
-
     func setSessID(_ id: String) {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        guard let client = opencodeClient else {
-            print("[ViewModel] setSessID: opencodeClient is nil, creating new client")
-            opencodeClient = OpencodeClient(config: appConfig)
-            opencodeClient?.setSessionID(trimmed)
-            currentSessID = trimmed
-            debugInfo = "Session ID set: \(trimmed.prefix(12))..."
-            return
-        }
-        client.setSessionID(trimmed)
+        ensureBackendClient()
+        opencodeClient?.setSessionID(trimmed)
         currentSessID = trimmed
         debugInfo = "Session ID set: \(trimmed.prefix(12))..."
     }
 
+    private func buildConversationHistory() -> String {
+        guard !messages.isEmpty else { return "" }
+        let recent = messages.suffix(10)
+        return recent.map { msg in
+            switch msg.role {
+            case .user: return "User: \(msg.text)\n"
+            case .assistant: return "Assistant: \(msg.text)\n"
+            }
+        }.joined()
+    }
+
     private func sendToOpencode(_ text: String) async {
+        await ensureOpencodeServer()
+
         guard let client = opencodeClient else {
             errorMessage = "Opencode client not initialized"
             stopConversation()
@@ -634,15 +660,20 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
                     self.streamingComplete = true
                     if self.pendingUtteranceCount == 0 {
-                        self.streamingComplete = false
-                        self.startListening()
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            try? await Task.sleep(nanoseconds: 1_000_000_000)
+                            while self.speechSynthesizer.isSpeaking {
+                                try? await Task.sleep(nanoseconds: 200_000_000)
+                            }
+                            self.streamingComplete = false
+                            self.startListening()
+                        }
                     }
                 }
             }
         )
     }
-
-    // MARK: - Built-in TTS
 
     private func streamTTSToken(_ token: String) {
         pendingSentence += token
@@ -673,7 +704,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             debugInfo = "Speaking..."
         }
 
-        print("[TTS] Speaking: \"\(trimmed.prefix(60))\"")
         pendingUtteranceCount += 1
 
         let language = detectLanguage(from: trimmed)
@@ -691,20 +721,23 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
     private func detectLanguage(from text: String) -> String {
         let chineseChars = text.unicodeScalars.filter { $0.value >= 0x4e00 && $0.value <= 0x9fff }
-        return chineseChars.isEmpty ? "english" : "chinese"
+        if !chineseChars.isEmpty { return "chinese" }
+        let hasLetters = text.unicodeScalars.contains { CharacterSet.letters.contains($0) }
+        if !hasLetters {
+            if let lastUser = messages.last(where: { $0.role == .user }) {
+                let userChinese = lastUser.text.unicodeScalars.filter { $0.value >= 0x4e00 && $0.value <= 0x9fff }
+                if !userChinese.isEmpty { return "chinese" }
+            }
+        }
+        return "english"
     }
 
-    // MARK: - Test
-
     func testTTS() {
-        print("[TTS] Test: macOS built-in TTS")
         let utterance = AVSpeechUtterance(string: "Hello world, this is a test of the built-in speech synthesizer.")
         utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate * ttsRate
         speechSynthesizer.speak(utterance)
     }
-
-    // MARK: - Audio Processing
 
     private static func downsample(_ samples: [Float], from srcRate: Int, to dstRate: Int) -> [Float] {
         guard srcRate != dstRate, !samples.isEmpty else { return samples }
@@ -722,14 +755,12 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         return result
     }
 
-    // MARK: - Model Info
-
     var backendDescription: String {
-        switch appConfig.backend {
+        switch selectedBackend {
         case "opencode":
-            return "LLM: opencode (\(appConfig.opencode.providerID)/\(appConfig.opencode.modelID))"
+            return "LLM: opencode (\(opencodeProviderID)/\(opencodeModelID))"
         default:
-            return "LLM: llama.cpp @ \(appConfig.llamacpp.serverURL)"
+            return "LLM: llama.cpp @ \(llamacppURL)"
         }
     }
 }

@@ -10,10 +10,18 @@ echo "=== Building MyLlamaSpeechAssistant ==="
 echo "[1/3] Building (fetching dependencies + compiling)..."
 swift build --disable-sandbox -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Sources/Info.plist
 
+BUILD_DIR="${SCRIPT_DIR}/.build"
+ARCH="$(uname -m)-apple-macosx"
+CONFIG="debug"
+OUT_DIR="${BUILD_DIR}/${ARCH}/${CONFIG}"
+if [[ ! -d "${OUT_DIR}" ]]; then
+    OUT_DIR="$(find "${BUILD_DIR}" -maxdepth 3 -type d -path "*/${CONFIG}" 2>/dev/null | head -n1 || true)"
+fi
+
 # Step 1.5: Sign with entitlements (required for microphone access on macOS 14+)
 echo "[1.5/3] Signing with entitlements..."
 
-BIN_PATH="${BUILD_DIR}/${ARCH}/${CONFIG}/MyLlamaSpeechAssistant"
+BIN_PATH="${OUT_DIR}/MyLlamaSpeechAssistant"
 if [[ ! -f "${BIN_PATH}" ]]; then
     BIN_PATH="$(find "${BUILD_DIR}" -name 'MyLlamaSpeechAssistant' -type f 2>/dev/null | head -n1 || true)"
 fi
@@ -26,14 +34,6 @@ fi
 
 # Step 2: Compile MLX Metal library from the fetched mlx-swift checkout
 echo "[2/3] Compiling MLX Metal library..."
-
-BUILD_DIR="${SCRIPT_DIR}/.build"
-ARCH="$(uname -m)-apple-macosx"
-CONFIG="debug"
-OUT_DIR="${BUILD_DIR}/${ARCH}/${CONFIG}"
-if [[ ! -d "${OUT_DIR}" ]]; then
-    OUT_DIR="$(find "${BUILD_DIR}" -maxdepth 3 -type d -path "*/${CONFIG}" 2>/dev/null | head -n1 || true)"
-fi
 
 # mlx-swift is fetched by SwiftPM into .build/checkouts/
 MLX_SWIFT_DIR="${BUILD_DIR}/checkouts/mlx-swift"
