@@ -95,7 +95,7 @@ struct AppConfig: Codable, Sendable {
             providerID: "llama.cpp",
             modelID: "qwen3.6",
             agent: "build",
-            directory: NSString(string: "~/source").expandingTildeInPath
+            directory: NSHomeDirectory()
         ),
         models: ModelsConfig(
             asrPath: "/Users/hasee/source/personaplex-mlx-swift/Qwen3-ASR-0.6B-MLX-4bit",

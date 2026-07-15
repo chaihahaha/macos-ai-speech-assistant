@@ -4,9 +4,10 @@ import Foundation
 struct ContentView: View {
     @StateObject private var viewModel = ViewModel()
     @State private var sessIDInput: String = ""
+    @State private var showSettings: Bool = false
 
     var body: some View {
-        VStack {
+        VStack(spacing: 0) {
             HStack {
                 Circle()
                     .fill(stateIndicatorColor)
@@ -21,10 +22,24 @@ struct ContentView: View {
                 if viewModel.isLoading {
                     ProgressView()
                 }
+
+                Button(action: { showSettings.toggle() }) {
+                    Image(systemName: showSettings ? "gearshape.fill" : "gearshape")
+                        .font(.title3)
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
             }
             .padding(.horizontal)
             .padding(.vertical, 8)
             .background(Color.gray.opacity(0.2))
+
+            if showSettings {
+                settingsPanel
+                    .padding(.horizontal)
+                    .padding(.vertical, 6)
+                    .background(Color.gray.opacity(0.05))
+            }
 
             if viewModel.conversationState == ViewModel.ConversationState.waitingSilence {
                 HStack {
@@ -42,35 +57,6 @@ struct ContentView: View {
                 .background(Color.blue.opacity(0.1))
             }
 
-            HStack(spacing: 6) {
-                Text("Session:")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                if let sid = viewModel.currentSessID {
-                    HStack(spacing: 4) {
-                        Text(sid.prefix(16) + "...")
-                            .font(.caption)
-                            .foregroundColor(.green)
-                            .lineLimit(1)
-                        Button(action: { viewModel.currentSessID = nil }) {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                } else {
-                    TextField("sess_id (optional)", text: $sessIDInput)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.caption)
-                        .frame(maxWidth: 200)
-                    Button("Set") { viewModel.setSessID(sessIDInput) }
-                        .font(.caption)
-                        .controlSize(.small)
-                }
-            }
-            .padding(.horizontal)
-
             HStack {
                 Text("ASR: Qwen3-ASR-0.6B-MLX-4bit (local)")
                     .font(.caption)
@@ -85,6 +71,7 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
             }
             .padding(.horizontal)
+            .padding(.vertical, 4)
 
             Divider()
 
@@ -178,7 +165,100 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Status
+    var settingsPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Backend:").font(.caption).foregroundColor(.secondary)
+                Picker("", selection: $viewModel.selectedBackend) {
+                    Text("llama.cpp").tag("llamacpp")
+                    Text("opencode").tag("opencode")
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: viewModel.selectedBackend) { _, _ in viewModel.applyBackendSettings() }
+            }
+
+            if viewModel.selectedBackend == "llamacpp" {
+                llamaSettings
+            } else {
+                opencodeSettings
+            }
+
+            HStack {
+                Spacer()
+                Button("Apply") { viewModel.applyBackendSettings() }
+                    .font(.caption)
+                    .controlSize(.small)
+            }
+        }
+    }
+
+    var llamaSettings: some View {
+        HStack(spacing: 6) {
+            Text("Server:").font(.caption).foregroundColor(.secondary)
+            TextField("http://127.0.0.1:8080", text: $viewModel.llamacppURL)
+                .textFieldStyle(.roundedBorder)
+                .font(.caption)
+        }
+    }
+
+    var opencodeSettings: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text("Server:").font(.caption).foregroundColor(.secondary)
+                TextField("http://127.0.0.1:9999", text: $viewModel.opencodeURL)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+            }
+            HStack(spacing: 6) {
+                Text("Provider:").font(.caption).foregroundColor(.secondary)
+                TextField("llama.cpp", text: $viewModel.opencodeProviderID)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .frame(maxWidth: 120)
+                Text("Model:").font(.caption).foregroundColor(.secondary)
+                TextField("qwen3.6", text: $viewModel.opencodeModelID)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .frame(maxWidth: 120)
+                Text("Agent:").font(.caption).foregroundColor(.secondary)
+                TextField("build", text: $viewModel.opencodeAgent)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .frame(maxWidth: 100)
+            }
+            HStack(spacing: 6) {
+                Text("Dir:").font(.caption).foregroundColor(.secondary)
+                TextField("~/source", text: $viewModel.opencodeDirectory)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+            }
+            HStack(spacing: 6) {
+                Text("Session:").font(.caption).foregroundColor(.secondary)
+                if let sid = viewModel.currentSessID {
+                    HStack(spacing: 4) {
+                        Text(sid.prefix(16) + "...")
+                            .font(.caption)
+                            .foregroundColor(.green)
+                            .lineLimit(1)
+                        Button(action: { viewModel.currentSessID = nil }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } else {
+                    TextField("sess_id (optional)", text: $sessIDInput)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                        .frame(maxWidth: 200)
+                    Button("Set") { viewModel.setSessID(sessIDInput) }
+                        .font(.caption)
+                        .controlSize(.small)
+                }
+            }
+        }
+    }
 
     var stateStatusText: String {
         switch viewModel.conversationState {
@@ -225,8 +305,6 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Message View Component
-
 struct MessageView: View {
     let message: Message
 
@@ -261,8 +339,6 @@ struct MessageView: View {
         return formatter.string(from: timestamp)
     }
 }
-
-// MARK: - Message Type
 
 struct Message: Identifiable {
     let id = UUID()

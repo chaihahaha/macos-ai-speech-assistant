@@ -1,23 +1,32 @@
 import Foundation
 
 final class OpencodeClient {
-    private let baseURL: String
-    private let directory: String
-    private let providerID: String
-    private let modelID: String
-    private let agent: String
+    var baseURL: String
+    var directory: String
+    var providerID: String
+    var modelID: String
+    var agent: String
     private var sessionID: String?
-    private var pollTask: Task<Void, Never>?
     private var onTextDelta: ((String) -> Void)?
     private var onComplete: (() -> Void)?
     private var completeCalled = false
 
-    init(config: AppConfig) {
-        self.baseURL = config.opencode.serverURL
-        self.directory = config.opencode.directory
-        self.providerID = config.opencode.providerID
-        self.modelID = config.opencode.modelID
-        self.agent = config.opencode.agent
+    init(baseURL: String, directory: String, providerID: String, modelID: String, agent: String) {
+        self.baseURL = baseURL
+        self.directory = directory
+        self.providerID = providerID
+        self.modelID = modelID
+        self.agent = agent
+    }
+
+    convenience init(config: AppConfig) {
+        self.init(
+            baseURL: config.opencode.serverURL,
+            directory: config.opencode.directory,
+            providerID: config.opencode.providerID,
+            modelID: config.opencode.modelID,
+            agent: config.opencode.agent
+        )
     }
 
     func setSessionID(_ id: String) {
@@ -27,19 +36,17 @@ final class OpencodeClient {
 
     func ensureSession() async throws {
         if sessionID != nil { return }
-
-        let url = URL(string: "\(baseURL)/session")!
+        let url = URL(string: "\(baseURL)/api/session")!
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if !directory.isEmpty {
-            req.setValue(directory, forHTTPHeaderField: "x-opencode-directory")
-        }
-        req.httpBody = try JSONSerialization.data(withJSONObject: [:])
-
+        if !directory.isEmpty { req.setValue(directory, forHTTPHeaderField: "x-opencode-directory") }
+        let body: [String: Any] = ["agent": agent, "model": ["id": modelID, "providerID": providerID]]
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, _) = try await URLSession.shared.data(for: req, delegate: nil)
         if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let id = json["id"] as? String {
+           let respData = json["data"] as? [String: Any],
+           let id = respData["id"] as? String {
             sessionID = id
             print("[Opencode] Created session: \(id)")
         }
@@ -56,164 +63,63 @@ final class OpencodeClient {
             try await ensureSession()
             guard let sid = sessionID else { return }
 
-            print("[Opencode] Sending prompt_async to \(sid) (agent: \(self.agent))")
-
-            let url = URL(string: "\(baseURL)/session/\(sid)/prompt_async")!
+            let url = URL(string: "\(baseURL)/session/\(sid)/message")!
             var req = URLRequest(url: url)
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.setValue(directory, forHTTPHeaderField: "x-opencode-directory")
-            req.timeoutInterval = 10
+            if !directory.isEmpty { req.setValue(directory, forHTTPHeaderField: "x-opencode-directory") }
+            req.timeoutInterval = 600
 
             let body: [String: Any] = [
-                "parts": [["type": "text", "text": text]],
                 "agent": self.agent,
-                "model": [
-                    "providerID": self.providerID,
-                    "modelID": self.modelID
-                ]
+                "model": ["providerID": self.providerID, "modelID": self.modelID],
+                "parts": [["type": "text", "text": text]]
             ]
             req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-            let (_, response) = try await URLSession.shared.data(for: req, delegate: nil)
+            let (data, response) = try await URLSession.shared.data(for: req, delegate: nil)
             if let httpResponse = response as? HTTPURLResponse {
-                print("[Opencode] prompt_async HTTP \(httpResponse.statusCode)")
+                print("[Opencode] v1 message HTTP \(httpResponse.statusCode)")
+            }
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let info = json["info"] as? [String: Any] else {
+                print("[Opencode] Invalid v1 response")
+                await callComplete()
+                return
             }
 
-            // Poll for the assistant response
-            startPolling(sessionID: sid)
-            print("[Opencode] Poll task started for session \(sid)")
+            let finish = info["finish"] as? String
+            var responseText = ""
+            if let parts = json["parts"] as? [[String: Any]] {
+                for part in parts {
+                    if let pt = part["type"] as? String, pt == "text",
+                       let txt = part["text"] as? String, !txt.isEmpty {
+                        responseText += txt
+                    }
+                }
+            }
+
+            print("[Opencode] v1 response: \(responseText.count) chars, finish=\(finish ?? "nil")")
+            if !responseText.isEmpty {
+                await MainActor.run { self.onTextDelta?(responseText) }
+            }
+            await callComplete()
         } catch {
             print("[Opencode] Send error: \(error)")
             if !Task.isCancelled { await callComplete() }
         }
     }
 
-    private func startPolling(sessionID sid: String) {
-        pollTask?.cancel()
-        var seenMessageIDs = Set<String>()
-        var lastText = ""
-
-        pollTask = Task { [weak self] in
-            guard let self else { return }
-
-            let deadline = Date().addingTimeInterval(300)
-            var lastMessageCount = 0
-
-            while Date() < deadline {
-                if Task.isCancelled { break }
-
-                do {
-                    let url = URL(string: "\(self.baseURL)/session/\(sid)/message?limit=10")!
-                    var req = URLRequest(url: url)
-                    req.setValue(self.directory, forHTTPHeaderField: "x-opencode-directory")
-                    req.timeoutInterval = 5
-
-                    let (data, _) = try await URLSession.shared.data(for: req, delegate: nil)
-                    guard let rawMessages = try JSONSerialization.jsonObject(with: data) as? [Any] else {
-                        print("[Opencode] Poll: unexpected response format")
-                        try await Task.sleep(nanoseconds: 2_000_000_000)
-                        continue
-                    }
-
-                    if seenMessageIDs.isEmpty {
-                        print("[Opencode] Poll: got \(rawMessages.count) messages")
-                    }
-
-                    // Process each message in the array
-                    for raw in rawMessages {
-                        guard let msg = raw as? [String: Any],
-                              let info = msg["info"] as? [String: Any],
-                              let msgID = info["id"] as? String,
-                              let role = info["role"] as? String else {
-                            continue
-                        }
-
-                        if role == "user" { continue }
-
-                        // Collect text from parts array
-                        var textParts: [String] = []
-                        if let parts = msg["parts"] as? [[String: Any]] {
-                            for part in parts {
-                                if let pt = part["type"] as? String, pt == "text",
-                                   let txt = part["text"] as? String, !txt.isEmpty {
-                                    textParts.append(txt)
-                                }
-                            }
-                        }
-                        if textParts.isEmpty { continue }
-
-                        let fullText = textParts.joined()
-
-                        if !seenMessageIDs.contains(msgID) {
-                            seenMessageIDs.insert(msgID)
-                            print("[Opencode] Poll: new assistant msg \(msgID.prefix(12)) \(fullText.count) chars")
-                            if !fullText.isEmpty {
-                                await MainActor.run { self.onTextDelta?(fullText) }
-                                lastText = fullText
-                            }
-                        } else if fullText.count > lastText.count {
-                            let delta = String(fullText.dropFirst(lastText.count))
-                            if !delta.isEmpty {
-                                await MainActor.run { self.onTextDelta?(delta) }
-                                lastText = fullText
-                            }
-                        }
-                    }
-
-                    let currentCount = seenMessageIDs.count
-                    if currentCount > 0, currentCount == lastMessageCount {
-                        // Check if the last assistant message is complete
-                        for raw in rawMessages {
-                            guard let msg = raw as? [String: Any],
-                                  let info = msg["info"] as? [String: Any],
-                                  let role = info["role"] as? String,
-                                  role == "assistant",
-                                  let msgID = info["id"] as? String,
-                                  seenMessageIDs.contains(msgID) else { continue }
-
-                            let finish = info["finish"] as? String
-                            let completed = info["time"] as? [String: Any]
-                            if finish == "stop" || finish == "error" || completed?["completed"] != nil {
-                                print("[Opencode] Poll: response complete (\(lastText.count) chars)")
-                                await callComplete()
-                                return
-                            }
-                        }
-                    }
-
-                    lastMessageCount = currentCount
-                } catch {
-                    if !Task.isCancelled {
-                        print("[Opencode] Poll error: \(error)")
-                    }
-                }
-
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-            }
-
-            // Timeout
-            print("[Opencode] Poll timeout")
-            await callComplete()
-        }
-    }
-
-    func abort() async {
-        pollTask?.cancel()
-        pollTask = nil
-
+    func interrupt() async {
         guard let sid = sessionID else { return }
-        let url = URL(string: "\(baseURL)/session/\(sid)/abort")!
+        let url = URL(string: "\(baseURL)/api/session/\(sid)/interrupt")!
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.setValue(directory, forHTTPHeaderField: "x-opencode-directory")
+        if !directory.isEmpty { req.setValue(directory, forHTTPHeaderField: "x-opencode-directory") }
         _ = try? await URLSession.shared.data(for: req, delegate: nil)
-        print("[Opencode] Aborted session \(sid)")
     }
 
     func reset() {
-        pollTask?.cancel()
-        pollTask = nil
         sessionID = nil
         onTextDelta = nil
         onComplete = nil
@@ -223,7 +129,6 @@ final class OpencodeClient {
     private func callComplete() async {
         guard !completeCalled else { return }
         completeCalled = true
-        pollTask?.cancel()
         await MainActor.run { onComplete?() }
     }
 
@@ -232,22 +137,25 @@ final class OpencodeClient {
         var req = URLRequest(url: healthURL)
         req.timeoutInterval = 2
         do {
-            let (data, _) = try await URLSession.shared.data(for: req, delegate: nil)
-            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let (data, resp) = try await URLSession.shared.data(for: req, delegate: nil)
+            guard let httpResp = resp as? HTTPURLResponse else { return false }
+            if httpResp.statusCode == 401 { return true }
+            if httpResp.statusCode == 200,
+               let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                let healthy = json["healthy"] as? Bool { return healthy }
         } catch {}
         return false
     }
 
-    static func startServer() -> Process? {
+    static func startServer(hostname: String = "0.0.0.0", port: Int = 9999) -> Process? {
         let task = Process()
         task.launchPath = "/usr/bin/env"
-        task.arguments = ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "9999"]
+        task.arguments = ["opencode", "serve", "--hostname", hostname, "--port", "\(port)"]
         task.standardOutput = FileHandle.nullDevice
         task.standardError = FileHandle.nullDevice
         do {
             try task.run()
-            print("[Opencode] Starting opencode serve...")
+            print("[Opencode] Starting opencode serve on \(hostname):\(port)...")
             return task
         } catch {
             print("[Opencode] Failed to start serve: \(error)")
