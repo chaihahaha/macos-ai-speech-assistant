@@ -82,23 +82,6 @@ struct ContentView: View {
                             MessageView(message: msg)
                                 .id(msg.id)
                         }
-
-                        if viewModel.isTyping || viewModel.conversationState == ViewModel.ConversationState.generating {
-                            HStack {
-                                Spacer()
-                                HStack(spacing: 4) {
-                                    Text("\u{25CF}")
-                                    Text("\u{25CF}")
-                                    Text("\u{25CF}")
-                                }
-                                .font(.body)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
-                                .background(Color.orange.opacity(0.2))
-                                .cornerRadius(8)
-                                Spacer()
-                            }
-                        }
                     }
                     .padding(.horizontal)
                     .padding(.vertical, 12)
@@ -148,6 +131,13 @@ struct ContentView: View {
                 }
                 .frame(width: 50, height: 50)
                 .disabled(viewModel.isLoading)
+
+                Button(action: { viewModel.copyConversation() }) {
+                    Image(systemName: "doc.on.doc")
+                        .font(.title3)
+                }
+                .frame(width: 50, height: 50)
+                .disabled(viewModel.messages.isEmpty)
 
                 Button(action: { viewModel.clearConversation() }) {
                     Image(systemName: "trash.circle")
@@ -317,6 +307,7 @@ struct MessageView: View {
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
                 Text(message.text)
                     .font(.body)
+                    .textSelection(.enabled)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
                     .background(message.role == .user ? Color.red.opacity(0.2) : Color.green.opacity(0.2))

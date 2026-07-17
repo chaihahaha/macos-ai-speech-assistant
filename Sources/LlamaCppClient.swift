@@ -5,7 +5,7 @@ final class LlamaCppClient: @unchecked Sendable {
     let systemPrompt: String
     let maxTokens: Int
     var onTextDelta: ((String) -> Void)?
-    var onComplete: (() -> Void)?
+    var onComplete: ((String) -> Void)?
     var completeCalled = false
     private var streamingTask: Task<Void, Never>?
 
@@ -18,7 +18,7 @@ final class LlamaCppClient: @unchecked Sendable {
     func sendMessage(_ text: String,
                      history: [Message],
                      onDelta: @escaping (String) -> Void,
-                     onComplete: @escaping () -> Void) {
+                     onComplete: @escaping (String) -> Void) {
         self.onTextDelta = onDelta
         self.onComplete = onComplete
         completeCalled = false
@@ -43,7 +43,7 @@ final class LlamaCppClient: @unchecked Sendable {
             ]
 
             guard let url = URL(string: "\(baseURL)/v1/chat/completions") else {
-                await callComplete()
+                await callComplete("")
                 return
             }
             var request = URLRequest(url: url)
@@ -55,7 +55,7 @@ final class LlamaCppClient: @unchecked Sendable {
                 request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
             } catch {
                 print("[LlamaCpp] Failed to serialize request: \(error)")
-                await callComplete()
+                await callComplete("")
                 return
             }
 
@@ -100,18 +100,21 @@ final class LlamaCppClient: @unchecked Sendable {
 
             let totalTime = Date().timeIntervalSince(startTime)
             print("[LlamaCpp] Finished in \(String(format: "%.2f", totalTime))s, \(assistantText.count) chars")
-            await callComplete()
+            await callComplete(assistantText)
         }
     }
 
     func cancel() {
+        completeCalled = true
+        onTextDelta = nil
+        onComplete = nil
         streamingTask?.cancel()
         streamingTask = nil
     }
 
-    private func callComplete() async {
+    private func callComplete(_ text: String) async {
         guard !completeCalled else { return }
         completeCalled = true
-        await MainActor.run { [weak self] in self?.onComplete?() }
+        await MainActor.run { [weak self] in self?.onComplete?(text) }
     }
 }

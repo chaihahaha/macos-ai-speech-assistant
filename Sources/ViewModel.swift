@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import AVFoundation
 import Qwen3ASR
 import SpeechVAD
@@ -58,6 +59,10 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private var silenceTimer: Timer?
     private var pendingSendTask: Task<Void, Never>?
     private var maxRecordingTimer: Timer?
+    private var beepTimer: Timer?
+    private var beepCount = 0
+    private var beepSound: NSSound? = NSSound(named: "Tink")
+    private var lastPlayPauseTime: Date = .distantPast
 
     private var opencodeResponseText = ""
 
@@ -84,9 +89,9 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
     private func setupMediaKeys() {
         mediaKeys.setHandlers(
-            playPause: { [weak self] in self?.toggleTTSSpeed() },
-            nextTrack: { [weak self] in self?.handleNextTrack() },
-            previousTrack: { }
+            playPause: { [weak self] in self?.handlePlayPause() },
+            nextTrack: { [weak self] in self?.toggleTTSSpeed() },
+            previousTrack: { [weak self] in self?.toggleTTSSpeed() }
         )
         mediaKeys.becomeNowPlaying()
     }
@@ -96,6 +101,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         llamaCppClient?.cancel()
         pendingSendTask?.cancel()
         maxRecordingTimer?.invalidate()
+        beepTimer?.invalidate()
         silenceTimer?.invalidate()
         opencodeClient?.reset()
         opencodeServerProcess?.terminate()
@@ -110,13 +116,36 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         opencodeClient = nil
         llamaCppClient = nil
         currentSessID = nil
+        mediaKeys.setPlaying()
         debugInfo = "Backend settings applied"
     }
 
+    private func handlePlayPause() {
+        let now = Date()
+        if now.timeIntervalSince(lastPlayPauseTime) < 0.5 {
+            print("[MediaKey] handlePlayPause: debounced (double-click)")
+            return
+        }
+        lastPlayPauseTime = now
+        print("[MediaKey] handlePlayPause, state=\(conversationState.rawValue)")
+        switch conversationState {
+        case .inactive:
+            startListening()
+        case .listening, .waitingSilence:
+            stopConversation(caller: "playPause")
+        case .generating, .speaking:
+            interruptConversation()
+        case .transcribing:
+            break
+        }
+        mediaKeys.setPlaying()
+    }
+
     private func toggleTTSSpeed() {
+        print("[MediaKey] toggleTTSSpeed, rate=\(ttsRate) state=\(conversationState.rawValue)")
         if ttsRate <= appConfig.tts.slowRate + 0.05 {
-            ttsRate = 2.0
-            debugInfo = "TTS: fast (2.0x)"
+            ttsRate = 1.5
+            debugInfo = "TTS: fast (1.5x)"
         } else {
             ttsRate = appConfig.tts.slowRate
             debugInfo = "TTS: slow (\(String(format: "%.1f", ttsRate))x)"
@@ -149,7 +178,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private func undoLastConversation() {
         print("[MediaKey] Undoing last conversation")
         if conversationState != .inactive {
-            stopConversation()
+            stopConversation(caller: "undoLastConversation")
         }
         guard let lastUser = messages.lastIndex(where: { $0.role == .user }) else {
             startListening()
@@ -170,6 +199,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         pendingUtteranceCount = 0
         streamingComplete = false
         pendingSentence = ""
+        isTyping = false
 
         llamaCppClient?.cancel()
         Task { await opencodeClient?.interrupt() }
@@ -179,7 +209,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                 msg.id == lastUserMsg.id || (msg.role == .assistant && msg.timestamp >= lastUserMsg.timestamp)
             }
         }
-        stopConversation()
+        stopConversation(caller: "interruptConversation")
         debugInfo = "Interrupted. Restarting listening..."
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 500_000_000)
@@ -277,7 +307,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                 stepRatio: 1.0
             )
             let processor = StreamingVADProcessor(model: vad, config: vadConfig)
-            recorder = AudioRecorder(targetSampleRate: 16000, vadProcessor: processor)
+            recorder = AudioRecorder(targetSampleRate: 16000, vadProcessor: processor, engine: mediaKeys.sharedAudioEngine())
 
             loadingStatus = "Ready"
             debugInfo = "Models loaded (backend: \(selectedBackend))"
@@ -329,6 +359,8 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     func startListening() {
+        mediaKeys.setPlaying()
+
         if speechSynthesizer.isSpeaking {
             Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 500_000_000)
@@ -350,6 +382,9 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         silenceTimer = nil
         silenceTimerValue = appConfig.vad.silenceTimeout
         pendingSentence = ""
+        beepTimer?.invalidate()
+        beepTimer = nil
+        beepCount = 0
         hasStartedSpeaking = false
         streamingComplete = false
         pendingUtteranceCount = 0
@@ -375,7 +410,8 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         recorder?.startRecording()
     }
 
-    func stopConversation() {
+    func stopConversation(caller: String = "direct") {
+        print("[VM] stopConversation, caller=\(caller), state=\(conversationState.rawValue)")
         logStateChange(.inactive)
         pendingSendTask?.cancel()
         pendingSendTask = nil
@@ -383,10 +419,13 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         llamaCppClient?.cancel()
         maxRecordingTimer?.invalidate()
         maxRecordingTimer = nil
+        beepTimer?.invalidate()
+        beepTimer = nil
 
         speechSynthesizer.stopSpeaking(at: .immediate)
         streamingComplete = false
         pendingUtteranceCount = 0
+        isTyping = false
 
         recorder?.onSpeechEnded = nil
         _ = recorder?.stopRecording()
@@ -403,7 +442,21 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         currentSessID = nil
     }
 
+    func copyConversation() {
+        guard !messages.isEmpty else { return }
+        let text = messages.map { msg in
+            let role = msg.role == .user ? "You" : "AI"
+            let time = DateFormatter.localizedString(from: msg.timestamp, dateStyle: .none, timeStyle: .short)
+            return "[\(time)] \(role): \(msg.text)"
+        }.joined(separator: "\n\n")
+
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        debugInfo = "Conversation copied to clipboard"
+    }
+
     private func onSpeechEnded() {
+        print("[VM] onSpeechEnded, state=\(conversationState.rawValue)")
         guard conversationState == .listening else { return }
 
         lastSpeechEndTime = Date()
@@ -413,6 +466,24 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         silenceTimer?.invalidate()
         silenceTimerValue = appConfig.vad.silenceTimeout
+        maxRecordingTimer?.invalidate()
+        maxRecordingTimer = nil
+
+        beepTimer?.invalidate()
+        beepCount = 0
+        beepTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.beepCount += 1
+                self.silenceTimerValue = max(0, self.silenceTimerValue - 1)
+                self.beepSound?.stop()
+                self.beepSound?.play()
+                if self.silenceTimerValue <= 0 {
+                    self.beepTimer?.invalidate()
+                    self.beepTimer = nil
+                }
+            }
+        }
 
         let timeout = appConfig.vad.silenceTimeout
         pendingSendTask?.cancel()
@@ -426,8 +497,9 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     private func processAndSend() async {
+        print("[VM] processAndSend, pendingAudio=\(pendingAudio.count) samples")
         guard !pendingAudio.isEmpty else {
-            stopConversation()
+            stopConversation(caller: "processAndSend_noAudio")
             debugInfo = "Auto-stopped: no speech detected"
             return
         }
@@ -437,6 +509,8 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         silenceTimer = nil
         maxRecordingTimer?.invalidate()
         maxRecordingTimer = nil
+        beepTimer?.invalidate()
+        beepTimer = nil
 
         debugInfo = "Sending after silence..."
         conversationState = .transcribing
@@ -447,7 +521,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         guard !audio.isEmpty, let asr = asrModel else {
             errorMessage = "No audio or ASR model."
-            stopConversation()
+            stopConversation(caller: "processAndSend_noAudio")
             return
         }
 
@@ -459,14 +533,15 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         _ = recorder?.stopRecording()
 
         let trimmed = asrText.trimmingCharacters(in: .whitespacesAndNewlines)
+        print("[VM] ASR result: '\(trimmed)' len=\(trimmed.count)")
         guard !trimmed.isEmpty else {
-            stopConversation()
+            stopConversation(caller: "processAndSend_noAudio")
             debugInfo = "Auto-stopped: empty ASR"
             return
         }
 
         guard isValidSpeech(trimmed) else {
-            stopConversation()
+            stopConversation(caller: "processAndSend_noAudio")
             debugInfo = "Auto-stopped: noise filtered"
             return
         }
@@ -483,10 +558,12 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     private func isValidSpeech(_ text: String) -> Bool {
-        if text.count < 5 { return false }
+        let chineseCount = text.unicodeScalars.filter { $0.value >= 0x4E00 && $0.value <= 0x9FFF }.count
+        let minChars = chineseCount > 0 ? 2 : 3
+        if text.count < minChars { return false }
         let noiseWords: Set<String> = ["the", "a", "an", "um", "umm", "emm", "ah", "oh", "uh", "er", "hmm", "huh", "eh", "ha", "mm", "mhm"]
         let words = text.lowercased().split(separator: " ")
-        if words.count <= 2 {
+        if words.count <= 1 {
             let contentWords = words.filter { !noiseWords.contains(String($0)) }
             if contentWords.isEmpty { return false }
         }
@@ -494,9 +571,10 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     private func sendToLlamaCpp(_ prompt: String) async {
+        print("[VM] sendToLlamaCpp, prompt=\(prompt.prefix(40))...")
         guard let client = llamaCppClient else {
             errorMessage = "LlamaCpp client not initialized"
-            stopConversation()
+            stopConversation(caller: "sendToLlamaCpp_noClient")
             return
         }
 
@@ -518,12 +596,17 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                     self?.streamTTSToken(delta)
                 }
             },
-            onComplete: { [weak self] in
+            onComplete: { [weak self] assistantText in
                 let totalTime = Date().timeIntervalSince(startTime)
                 print("[LlamaCpp] Total time: \(String(format: "%.2f", totalTime))s")
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.isTyping = false
+
+                    if !assistantText.isEmpty {
+                        self.messages.append(Message(role: .assistant, text: assistantText))
+                        self.logMessage(self.messages.last!)
+                    }
 
                     if !self.pendingSentence.isEmpty {
                         self.speakSentence(self.pendingSentence)
@@ -561,7 +644,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         guard let client = opencodeClient else {
             errorMessage = "Opencode client not initialized"
-            stopConversation()
+            stopConversation(caller: "sendToOpencode_noClient")
             return
         }
 
