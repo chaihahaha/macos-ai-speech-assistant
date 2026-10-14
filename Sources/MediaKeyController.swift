@@ -3,17 +3,47 @@ import AppKit
 import MediaPlayer
 import AVFoundation
 
+/// Receives the hardware media keys (play/pause, next, previous) and forwards
+/// them to the app as simple, *deduplicated* callbacks.
+///
+/// Why the deduplication exists: a single physical media-key press can be
+/// delivered to us through up to three independent channels — the global
+/// `NSEvent` monitor, the local `NSEvent` monitor and the `MPRemoteCommandCenter`
+/// (via `playCommand` / `pauseCommand` / `togglePlayPauseCommand`). Without
+/// deduplication one press fires the handler two or three times, which used to
+/// be papered over by a 500 ms debounce in `ViewModel`. That debounce also
+/// swallowed legitimate rapid presses, so the fix is to deduplicate the
+/// *duplicate deliveries of one press* here (a short window) and let the
+/// business logic respond to every real press immediately.
 @MainActor
 final class MediaKeyController {
+    enum Action: Hashable {
+        case playPause
+        case next
+        case previous
+    }
+
+    /// Window within which repeat deliveries of the same action are treated as
+    /// one physical key press. The original code used 500 ms for this in
+    /// `ViewModel` because one press can be delivered through several channels;
+    /// we keep the same empirically-safe width but collapse the duplicates at
+    /// the source, so the business logic no longer has to debounce (and no
+    /// longer swallows legitimate presses for *every* state).
+    private static let dedupInterval: TimeInterval = 0.5
+
     private var onPlayPause: (() -> Void)?
     private var onNextTrack: (() -> Void)?
     private var onPreviousTrack: (() -> Void)?
+
     private var globalEventMonitor: Any?
     private var localEventMonitor: Any?
+    private var spaceKeyMonitor: Any?
     private var keepAliveTimer: Timer?
     private var silentEngine: AVAudioEngine?
     private var silentPlayer: AVAudioPlayerNode?
     private var eventTap: CFMachPort?
+
+    private var lastFireTime: [Action: Date] = [:]
 
     init() {
         setupRemoteCommands()
@@ -28,6 +58,32 @@ final class MediaKeyController {
         onNextTrack = nextTrack
         onPreviousTrack = previousTrack
     }
+
+    // MARK: - Dispatch
+
+    /// Single funnel for every trigger (NSEvent, MPRemote, Space). Deduplicates
+    /// the same action fired twice within `dedupInterval` so one physical press
+    /// results in exactly one handler call.
+    private func fire(_ action: Action, source: String) {
+        let now = Date()
+        if let last = lastFireTime[action], now.timeIntervalSince(last) < Self.dedupInterval {
+            print("[MediaKeys] (\(source)) \(action) deduplicated (\(String(format: "%.3f", now.timeIntervalSince(last)))s)")
+            return
+        }
+        lastFireTime[action] = now
+        print("[MediaKeys] (\(source)) \(action) fired")
+
+        switch action {
+        case .playPause:
+            onPlayPause?()
+        case .next:
+            onNextTrack?()
+        case .previous:
+            onPreviousTrack?()
+        }
+    }
+
+    // MARK: - Now Playing
 
     func becomeNowPlaying() {
         setNowPlayingInfo()
@@ -68,15 +124,18 @@ final class MediaKeyController {
 
     private func pingNowPlaying() {
         let center = MPNowPlayingInfoCenter.default()
-        if var info = center.nowPlayingInfo {
-            let t = info[MPNowPlayingInfoPropertyElapsedPlaybackTime] as? Double ?? 0
-            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = t + 0.5
-            info[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
-            center.nowPlayingInfo = info
-        } else {
+        guard var info = center.nowPlayingInfo else {
             print("[MediaKeys] nowPlayingInfo was nil, re-asserting!")
             setNowPlayingInfo()
+            return
         }
+        let playing = center.playbackState == .playing
+        if playing {
+            let t = info[MPNowPlayingInfoPropertyElapsedPlaybackTime] as? Double ?? 0
+            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = t + 0.5
+        }
+        info[MPNowPlayingInfoPropertyPlaybackRate] = playing ? 1.0 : 0.0
+        center.nowPlayingInfo = info
     }
 
     func refreshNowPlaying() {
@@ -87,8 +146,25 @@ final class MediaKeyController {
         }
     }
 
-    func setPaused() { MPNowPlayingInfoCenter.default().playbackState = .paused }
-    func setPlaying() { MPNowPlayingInfoCenter.default().playbackState = .playing }
+    func setPaused() {
+        let center = MPNowPlayingInfoCenter.default()
+        center.playbackState = .paused
+        if var info = center.nowPlayingInfo {
+            info[MPNowPlayingInfoPropertyPlaybackRate] = 0.0
+            center.nowPlayingInfo = info
+        }
+    }
+
+    func setPlaying() {
+        let center = MPNowPlayingInfoCenter.default()
+        center.playbackState = .playing
+        if var info = center.nowPlayingInfo {
+            info[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
+            center.nowPlayingInfo = info
+        }
+    }
+
+    // MARK: - Silent playback (keeps the app registered as "Now Playing")
 
     func startSilentPlayback() {
         guard silentEngine == nil else { return }
@@ -99,14 +175,15 @@ final class MediaKeyController {
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: format)
 
-        let silence = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1024)!
-        silence.frameLength = 1024
-        memset(silence.floatChannelData?[0], 0, Int(1024 * format.streamDescription.pointee.mBytesPerFrame))
+        guard let silence = makeSilenceBuffer(format: format) else {
+            print("[MediaKeys] Silent playback skipped: bad output format")
+            return
+        }
 
         do {
             try engine.start()
             player.scheduleBuffer(silence, at: nil, options: .loops)
-            player.volume = 0.01
+            player.volume = 0.0
             player.play()
             silentEngine = engine
             silentPlayer = player
@@ -131,21 +208,33 @@ final class MediaKeyController {
         let format = engine.outputNode.inputFormat(forBus: 0)
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: format)
-        let silence = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1024)!
-        silence.frameLength = 1024
-        memset(silence.floatChannelData?[0], 0, Int(1024 * format.streamDescription.pointee.mBytesPerFrame))
-        do {
-            try engine.start()
-            player.scheduleBuffer(silence, at: nil, options: .loops)
-            player.volume = 0.01
-            player.play()
-            silentEngine = engine
-            silentPlayer = player
-            print("[MediaKeys] Silent playback started (lazy)")
-        } catch {
-            print("[MediaKeys] Silent playback failed: \(error)")
+        if let silence = makeSilenceBuffer(format: format) {
+            do {
+                try engine.start()
+                player.scheduleBuffer(silence, at: nil, options: .loops)
+                player.volume = 0.0
+                player.play()
+                silentEngine = engine
+                silentPlayer = player
+                print("[MediaKeys] Silent playback started (lazy)")
+            } catch {
+                print("[MediaKeys] Silent playback failed: \(error)")
+            }
         }
         return engine
+    }
+
+    private func makeSilenceBuffer(format: AVAudioFormat) -> AVAudioPCMBuffer? {
+        guard let silence = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1024),
+              let channelData = silence.floatChannelData else {
+            return nil
+        }
+        silence.frameLength = 1024
+        let byteCount = Int(1024 * format.streamDescription.pointee.mBytesPerFrame)
+        for channel in 0..<Int(format.channelCount) {
+            memset(channelData[channel], 0, byteCount)
+        }
+        return silence
     }
 
     func resignNowPlaying() {
@@ -155,86 +244,51 @@ final class MediaKeyController {
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
     }
 
+    // MARK: - Remote command center
+
     private func setupRemoteCommands() {
         let center = MPRemoteCommandCenter.shared()
 
-        center.playCommand.addTarget { [weak self] _ in
-            print("[MediaKeys] MPRemote: playCommand")
-            self?.dispatchOnMainActor { $0.onPlayPause?() }
+        let playPause: (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus = { [weak self] _ in
+            self?.dispatchOnMainActor { $0.fire(.playPause, source: "MPRemote") }
             return .success
         }
-        center.pauseCommand.addTarget { [weak self] _ in
-            print("[MediaKeys] MPRemote: pauseCommand")
-            self?.dispatchOnMainActor { $0.onPlayPause?() }
+        center.playCommand.addTarget(handler: playPause)
+        center.pauseCommand.addTarget(handler: playPause)
+        center.togglePlayPauseCommand.addTarget(handler: playPause)
+
+        let next: (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus = { [weak self] _ in
+            self?.dispatchOnMainActor { $0.fire(.next, source: "MPRemote") }
             return .success
         }
+        center.nextTrackCommand.addTarget(handler: next)
+        center.seekForwardCommand.addTarget(handler: next)
+        center.skipForwardCommand.addTarget(handler: next)
+
+        let previous: (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus = { [weak self] _ in
+            self?.dispatchOnMainActor { $0.fire(.previous, source: "MPRemote") }
+            return .success
+        }
+        center.previousTrackCommand.addTarget(handler: previous)
+        center.seekBackwardCommand.addTarget(handler: previous)
+        center.skipBackwardCommand.addTarget(handler: previous)
+
         center.stopCommand.addTarget { _ in
             print("[MediaKeys] MPRemote: stopCommand")
             return .success
         }
-        center.togglePlayPauseCommand.addTarget { [weak self] _ in
-            print("[MediaKeys] MPRemote: togglePlayPauseCommand")
-            self?.dispatchOnMainActor { $0.onPlayPause?() }
-            return .success
-        }
-
-        center.nextTrackCommand.addTarget { [weak self] _ in
-            print("[MediaKeys] MPRemote: nextTrackCommand")
-            self?.dispatchOnMainActor { $0.onNextTrack?() }
-            return .success
-        }
-
-        center.previousTrackCommand.addTarget { [weak self] _ in
-            print("[MediaKeys] MPRemote: previousTrackCommand")
-            self?.dispatchOnMainActor { $0.onPreviousTrack?() }
-            return .success
-        }
-
-        center.seekForwardCommand.addTarget { [weak self] _ in
-            print("[MediaKeys] MPRemote: seekForwardCommand")
-            self?.dispatchOnMainActor { $0.onNextTrack?() }
-            return .success
-        }
-
-        center.seekBackwardCommand.addTarget { [weak self] _ in
-            print("[MediaKeys] MPRemote: seekBackwardCommand")
-            self?.dispatchOnMainActor { $0.onPreviousTrack?() }
-            return .success
-        }
-
-        center.skipForwardCommand.addTarget { [weak self] _ in
-            print("[MediaKeys] MPRemote: skipForwardCommand")
-            self?.dispatchOnMainActor { $0.onNextTrack?() }
-            return .success
-        }
-
-        center.skipBackwardCommand.addTarget { [weak self] _ in
-            print("[MediaKeys] MPRemote: skipBackwardCommand")
-            self?.dispatchOnMainActor { $0.onPreviousTrack?() }
-            return .success
-        }
-
         center.changePlaybackPositionCommand.addTarget { _ in
-            print("[MediaKeys] MPRemote: changePlaybackPosition")
             return .success
         }
+        center.likeCommand.addTarget { _ in .success }
+        center.dislikeCommand.addTarget { _ in .success }
+        center.bookmarkCommand.addTarget { _ in .success }
 
-        center.likeCommand.addTarget { _ in
-            print("[MediaKeys] MPRemote: likeCommand")
-            return .success
-        }
-        center.dislikeCommand.addTarget { _ in
-            print("[MediaKeys] MPRemote: dislikeCommand")
-            return .success
-        }
-        center.bookmarkCommand.addTarget { _ in
-            print("[MediaKeys] MPRemote: bookmarkCommand")
-            return .success
-        }
-
+        // Only advertise the commands we actually handle, otherwise macOS may
+        // grey out / reroute media keys.
         center.playCommand.isEnabled = true
         center.pauseCommand.isEnabled = true
-        center.stopCommand.isEnabled = true
+        center.stopCommand.isEnabled = false
         center.togglePlayPauseCommand.isEnabled = true
         center.nextTrackCommand.isEnabled = true
         center.previousTrackCommand.isEnabled = true
@@ -242,17 +296,26 @@ final class MediaKeyController {
         center.seekBackwardCommand.isEnabled = true
         center.skipForwardCommand.isEnabled = true
         center.skipBackwardCommand.isEnabled = true
-        center.changePlaybackPositionCommand.isEnabled = true
+        center.changePlaybackPositionCommand.isEnabled = false
+        center.likeCommand.isEnabled = false
+        center.dislikeCommand.isEnabled = false
+        center.bookmarkCommand.isEnabled = false
 
-        print("[MediaKeys] MPRemoteCommandCenter configured (all commands)")
+        print("[MediaKeys] MPRemoteCommandCenter configured")
     }
 
     private func dispatchOnMainActor(_ block: @escaping (MediaKeyController) -> Void) {
+        if Thread.isMainThread {
+            block(self)
+            return
+        }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             block(self)
         }
     }
+
+    // MARK: - NSEvent monitors
 
     private func setupEventMonitors() {
         globalEventMonitor = NSEvent.addGlobalMonitorForEvents(matching: .systemDefined) { [weak self] event in
@@ -262,14 +325,18 @@ final class MediaKeyController {
             self?.handleSystemEvent(event, source: "Local")
             return event
         }
-        _ = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.keyCode == 49 {
-                print("[MediaKeys] NSEvent: Space key")
-                DispatchQueue.main.async { self?.onPlayPause?() }
-                return nil
+
+        // Space bar acts as play/pause, but must never be hijacked while the
+        // user is typing into one of the app's text fields.
+        spaceKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard event.keyCode == 49 else { return event }
+            if NSApp.keyWindow?.firstResponder is NSTextView {
+                return event
             }
-            return event
+            self?.fire(.playPause, source: "Space")
+            return nil
         }
+
         print("[MediaKeys] Global + Local event monitors installed")
     }
 
@@ -288,35 +355,37 @@ final class MediaKeyController {
             }
         }()
 
-        print("[MediaKeys] NSEvent(\(source)): keyCode=\(keyCode) (0x\(String(keyCode, radix: 16))) state=\(stateLabel) repeat=\(keyRepeat)")
+        // Ignore key-up and auto-repeat; only the initial key-down matters.
+        guard keyState == 0x0A, !keyRepeat else {
+            if keyState == 0x0A && keyRepeat {
+                print("[MediaKeys] NSEvent(\(source)): keyCode=\(keyCode) repeat ignored")
+            }
+            return
+        }
 
-        guard keyState == 0x0A, !keyRepeat else { return }
+        print("[MediaKeys] NSEvent(\(source)): keyCode=\(keyCode) (0x\(String(keyCode, radix: 16))) state=\(stateLabel)")
 
         let NX_KEYTYPE_PLAY: Int = 16
         let NX_KEYTYPE_NEXT: Int = 17
         let NX_KEYTYPE_PREVIOUS: Int = 18
 
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            switch keyCode {
-            case NX_KEYTYPE_PLAY:
-                print("[MediaKeys] => NSEvent: PLAY triggered")
-                self.onPlayPause?()
-            case NX_KEYTYPE_NEXT:
-                print("[MediaKeys] => NSEvent: NEXT triggered")
-                self.onNextTrack?()
-            case NX_KEYTYPE_PREVIOUS:
-                print("[MediaKeys] => NSEvent: PREVIOUS triggered")
-                self.onPreviousTrack?()
-            default:
-                print("[MediaKeys] => NSEvent: unknown keyCode=\(keyCode), ignoring")
-            }
+        switch keyCode {
+        case NX_KEYTYPE_PLAY:
+            fire(.playPause, source: "NSEvent.\(source)")
+        case NX_KEYTYPE_NEXT:
+            fire(.next, source: "NSEvent.\(source)")
+        case NX_KEYTYPE_PREVIOUS:
+            fire(.previous, source: "NSEvent.\(source)")
+        default:
+            print("[MediaKeys] unknown keyCode=\(keyCode), ignoring")
         }
     }
 
     private func setupCGEventTap() {
-        // CGEvent tap disabled in favor of NSEvent monitors + MPRemote
-        print("[MediaKeys] CGEvent tap skipped (using NSEvent monitors)")
+        // CGEvent tap intentionally disabled: it requires Accessibility
+        // permission and can freeze the whole session if the tap callback is
+        // slow. NSEvent monitors + MPRemoteCommandCenter are sufficient.
+        print("[MediaKeys] CGEvent tap skipped (using NSEvent monitors + MPRemote)")
     }
 
     deinit {
@@ -327,6 +396,7 @@ final class MediaKeyController {
         if let tap = eventTap { CFMachPortInvalidate(tap) }
         if let m = globalEventMonitor { NSEvent.removeMonitor(m) }
         if let m = localEventMonitor { NSEvent.removeMonitor(m) }
+        if let m = spaceKeyMonitor { NSEvent.removeMonitor(m) }
         let center = MPRemoteCommandCenter.shared()
         center.playCommand.removeTarget(nil)
         center.pauseCommand.removeTarget(nil)

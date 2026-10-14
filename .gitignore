@@ -1,3 +1,14 @@
 .build/
 Package.resolved
 conversation_history/
+
+# 临时与日志（AGENTS.md 约定）
+/tmp/
+/logs/
+
+# 系统与编辑器
+.DS_Store
+*.swp
+*~
+__pycache__/
+*.pyc

@@ -101,7 +101,8 @@ final class OpencodeClient {
 
             print("[Opencode] v1 response: \(responseText.count) chars, finish=\(finish ?? "nil")")
             if !responseText.isEmpty {
-                await MainActor.run { self.onTextDelta?(responseText) }
+                let responseChunk = responseText
+                await MainActor.run { self.onTextDelta?(responseChunk) }
             }
             await callComplete()
         } catch {
@@ -117,6 +118,15 @@ final class OpencodeClient {
         req.httpMethod = "POST"
         if !directory.isEmpty { req.setValue(directory, forHTTPHeaderField: "x-opencode-directory") }
         _ = try? await URLSession.shared.data(for: req, delegate: nil)
+    }
+
+    /// Client-side abort of the request currently being awaited: any late
+    /// completion/delta from it will be ignored instead of resurrecting the
+    /// conversation after the user interrupted it.
+    func cancelPending() {
+        completeCalled = true
+        onTextDelta = nil
+        onComplete = nil
     }
 
     func reset() {
