@@ -257,3 +257,41 @@ otool -s __TEXT __info_plist .build/debug/MyLlamaSpeechAssistant   # 必须能�
 
 **排查口诀**：`listening` 卡住 + 没有 `TAP: first callback` → 先查内嵌 Info.plist，再查
 系统设置里的麦克风授权。
+
+---
+
+## 11. 两个 AVAudioEngine：输出引擎先启动 → 输入 tap 永远收不到回调
+
+**现象**
+
+`[AudioRecorder] engine started` / `capture started` 之后**没有** `TAP: first callback`，
+界面永远停在 `listening`。单独跑一个"只开输入"的 probe 却完全正常
+（`callbacks=40, peak=0.09`），说明麦克风、权限、设备都没问题。
+
+**复现（本机实测）**
+
+1. 先启动一个 output-only 的 `AVAudioEngine`（播放静音循环，即 Now Playing keep-alive）；
+2. 再创建**第二个** `AVAudioEngine`，`installTap` 到 inputNode，`start()`。
+
+结果：`start()` 返回成功，但 `isRunning` 随后变成 `false`，4 秒内 **0 个 input 回调**，
+两个引擎都停止。反过来（先输入、后输出）则一切正常。
+
+**原因**
+
+两个 engine 同时争用同一个音频设备；蓝牙 A2DP↔HFP 切换的窗口里，输出引擎先占住设备，
+输入引擎静默失败（不抛错）。22:22 那次偶尔成功，是因为 keep-alive 引擎恰好在"重启之间的空档"，
+输入抢到了设备。
+
+**修复**
+
+**任何时刻只允许一个 `AVAudioEngine` 运行**：
+
+* 开始录音前：`MediaKeyController.pauseKeepAliveForRecording()` 停掉 output-only keep-alive 引擎。
+* 录音引擎自带一个静音 `AVAudioPlayerNode`，让进程在录音期间仍然算 Now Playing，媒体键可用。
+  **attach/connect/schedule 必须在 `engine.start()` 之前完成，`play()` 放在 start 之后**；
+  在引擎运行中修改 graph 会卡死/崩溃（实测）。
+* 停止录音后：录音引擎 `stop()` + `reset()`，再 `resumeKeepAliveAfterRecording()` 重建
+  output-only keep-alive 引擎。
+* `ViewModel.stopRecordingAndResumeKeepAlive()` 统一封装"停录音 + 恢复 keep-alive"。
+
+**排查口诀**：`capture started` 但没有 `TAP: first callback` → 检查进程里是不是还有另一个 engine 在跑。

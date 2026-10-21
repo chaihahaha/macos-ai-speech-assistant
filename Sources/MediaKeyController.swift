@@ -62,6 +62,8 @@ final class MediaKeyController {
 
     private var lastFireTime: [Action: Date] = [:]
     private var silentRestartCount = 0
+    /// True while the recorder's duplex engine owns the audio device.
+    private var recordingActive = false
 
     init() {
         setupRemoteCommands()
@@ -166,7 +168,9 @@ final class MediaKeyController {
         // way media keys reach us. The engine can die when the audio device is
         // reconfigured (Bluetooth A2DP <-> HFP when the mic opens), so restart
         // it when needed.
-        if silentEngine?.isRunning != true {
+        if recordingActive {
+            // The recorder engine owns the device and plays its own silence.
+        } else if silentEngine?.isRunning != true {
             silentRestartCount += 1
             if silentRestartCount <= 3 || silentRestartCount % 60 == 0 {
                 log("[MediaKeys] keep-alive engine not running (attempt \(silentRestartCount)); restarting")
@@ -226,6 +230,26 @@ final class MediaKeyController {
     }
 
     // MARK: - Silent playback (keeps the app registered as "Now Playing")
+
+    /// Call immediately before starting the recording engine. Two AVAudioEngines
+    /// where the output one starts first makes the input tap receive zero
+    /// callbacks (both engines end up not running). The recorder's own silent
+    /// player keeps us Now Playing during recording.
+    func pauseKeepAliveForRecording() {
+        recordingActive = true
+        stopSilentPlayback()
+        log("[MediaKeys] keep-alive paused for recording")
+    }
+
+    func resumeKeepAliveAfterRecording() {
+        recordingActive = false
+        if silentEngine?.isRunning != true {
+            stopSilentPlayback()
+            startSilentPlayback()
+        }
+        setPlaying()
+        log("[MediaKeys] keep-alive resumed after recording")
+    }
 
     func startSilentPlayback() {
         guard silentEngine == nil else { return }

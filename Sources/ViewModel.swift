@@ -347,7 +347,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                 guard let self, self.isCurrent(gen) else { return }
                 guard self.conversationState == .listening || self.conversationState == .waitingSilence else { return }
                 print("[VM] maxRecordingDuration reached")
-                self.pendingAudio = self.recorder?.stopRecording() ?? []
+                self.pendingAudio = self.stopRecordingAndResumeKeepAlive()
                 self.cancelPendingWork(cancelPipeline: false)
                 self.launchPipeline(generation: gen)
             }
@@ -360,7 +360,11 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             }
         }
 
+        mediaKeys.pauseKeepAliveForRecording()
         recorder?.startRecording()
+        if recorder?.isRecording != true {
+            mediaKeys.resumeKeepAliveAfterRecording()
+        }
     }
 
     func stopConversation(caller: String = "direct") {
@@ -384,7 +388,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         isTyping = false
 
         recorder?.onSpeechEnded = nil
-        _ = recorder?.stopRecording()
+        _ = stopRecordingAndResumeKeepAlive()
 
         conversationState = .inactive
         logStateChange(.inactive)
@@ -465,6 +469,15 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         hasStartedSpeaking = false
         pendingSentence = ""
         streamingComplete = false
+    }
+
+    /// Stops the recorder and immediately restarts the output-only Now Playing
+    /// engine (only one AVAudioEngine at a time; see PITFALL.md #11).
+    @discardableResult
+    private func stopRecordingAndResumeKeepAlive() -> [Float] {
+        let samples = recorder?.stopRecording() ?? []
+        mediaKeys.resumeKeepAliveAfterRecording()
+        return samples
     }
 
     /// Schedules `startListening()` after `delay`, in a task that is cancelled by
@@ -738,7 +751,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         print("[VM] onSpeechEnded, state=\(conversationState.rawValue)")
 
         conversationState = .waitingSilence
-        pendingAudio = recorder?.stopRecording() ?? []
+        pendingAudio = stopRecordingAndResumeKeepAlive()
 
         silenceTimerValue = appConfig.vad.silenceTimeout
         maxRecordingTimer?.invalidate()
@@ -832,7 +845,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             return
         }
 
-        _ = recorder?.stopRecording()
+        _ = stopRecordingAndResumeKeepAlive()
 
         let trimmed = asrText.trimmingCharacters(in: .whitespacesAndNewlines)
         print("[VM] ASR result: '\(trimmed)' len=\(trimmed.count)")
