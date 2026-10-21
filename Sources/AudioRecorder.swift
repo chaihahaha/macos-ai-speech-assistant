@@ -36,6 +36,11 @@ final class AudioRecorder {
 
     /// Recreated for every capture attempt.
     private var engine = AVAudioEngine()
+    /// A silent player kept on the SAME engine as the input tap. It gives the
+    /// headset an active output stream as well, which is what makes the HFP/SCO
+    /// microphone actually deliver audio (a call is bidirectional; input-only
+    /// engines can expose a 16 kHz endpoint that only returns zeros).
+    private var silentPlayer: AVAudioPlayerNode?
     private var samples: [Float] = []
     /// Peak absolute sample seen since `startRecording()` (guarded by `sampleLock`).
     private var peak: Float = 0
@@ -258,8 +263,25 @@ final class AudioRecorder {
         }
         tapInstalled = true
 
+        // Duplex: add a silent output stream to activate the headset mic (SCO).
+        let playerFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                         sampleRate: targetSampleRate,
+                                         channels: 1,
+                                         interleaved: false) ?? recordingFormat
+        let player = AVAudioPlayerNode()
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: playerFormat)
+        silentPlayer = player
+        report("[AudioRecorder] duplex silent player format=\(playerFormat), outputNode=\(engine.outputNode.inputFormat(forBus: 0))")
+
+        if let silence = AVAudioPCMBuffer(pcmFormat: playerFormat, frameCapacity: 1024) {
+            player.scheduleBuffer(silence, at: nil, options: .loops)
+            player.volume = 0.0
+        }
+
         do {
             try engine.start()
+            player.play()
             report("[AudioRecorder] engine started")
         } catch {
             report("[AudioRecorder] engine start failed: \(error)")
@@ -349,6 +371,8 @@ final class AudioRecorder {
     }
 
     private func teardownEngine() {
+        silentPlayer?.stop()
+        silentPlayer = nil
         if tapInstalled {
             engine.inputNode.removeTap(onBus: 0)
             tapInstalled = false

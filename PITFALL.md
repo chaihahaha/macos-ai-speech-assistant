@@ -659,3 +659,23 @@ try inputNode.setVoiceProcessingEnabled(true)
 * **静音门限**：从 peak 0.005 改为整段 **RMS < 0.003** 判定无语音；60 秒噪声 clip 的
   RMS 远低于此，不会再进 ASR。
 * 录音超时路径同样用 RMS < 0.002 直接回 idle。
+
+---
+
+## 21. input-only 无法激活耳机麦克风：加 duplex 静音输出
+
+日志：16k 输入 tap 连续回调 60 秒，`periodPeak=0.0000`，超时正常回 idle。说明 HFP 输入
+端点存在但没有 SCO 音频；input-only 引擎没有让耳机进入真正的双向通话。
+
+修复：在同一个 `AVAudioEngine` 上，除了 input tap，再 attach 一个 `AVAudioPlayerNode`，
+用 16 kHz 单声道格式连接到 `mainMixerNode`，循环播放**静音** buffer（volume 0）。
+这样耳机同时看到输入和输出流，等价于通话 App 的双向 HFP，SCO 才会被激活。
+
+日志会打印：
+
+```
+[AudioRecorder] duplex silent player format=<1 ch, 16000 Hz>, outputNode=<...>
+```
+
+然后看 `level periodPeak` 是否变成 0.0x。若 outputNode 仍是 44.1 kHz 且 peak 仍为 0，
+下一步需要把耳机输出强制到 16 kHz/HFP（CoreAudio nominal rate）后再建 duplex engine。

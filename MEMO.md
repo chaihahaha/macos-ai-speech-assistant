@@ -124,6 +124,9 @@
   一半/幻觉；不要再用。判断静音用整段 RMS（<0.003）而不是 peak。
 * **等待期间继续采集**：VAD end 不再立刻 finishCapture；`onSpeechStarted` 取消发送并继续
   收集，避免一句话只识别前半段。
+* **HFP 16k 全 0 → duplex**：input-only 不激活 SCO。现在在录音 engine 上再 attach 一个
+  16k 单声道静音 player（volume 0，loop），让耳机看到双向流（等价通话）。日志打印
+  duplex player/outputNode 格式；若 outputNode=44.1k 且 peak 仍 0，下一步强制 HFP 16k。
 * **HFP 16k 全 0**：input-only engine 可能不激活 SCO；在 beginCapture 里先
   `inputNode.setVoiceProcessingEnabled(true)`（VPIO 通话路径）。日志确认
   `voice processing enabled`；若仍全 0，下一步加 16k 静音 player 做 duplex。
