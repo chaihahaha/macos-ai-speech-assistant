@@ -702,17 +702,16 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                         return
                     }
                     self.captureRecoveryInProgress = true
-                    let ok = await self.headset.reconnect()
+                    // Soft recovery: never close/open the Bluetooth link here.
+                    // Re-pin the (still connected) headset, give the HFP link a
+                    // moment, then retry the capture once.
+                    self.errorMessage = "麦克风暂时不可用，正在重试…"
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    _ = self.headset.pinDefaults()
                     self.captureRecoveryInProgress = false
-                    if ok {
-                        self.errorMessage = nil
-                        self.debugInfo = "Headset reconnected. Listening…"
-                        self.logConversation("[\(self.timestamp())] HEADSET: reconnected, retrying recording")
-                        self.startListening()
-                    } else {
-                        self.errorMessage = "Bluetooth headset not connected. Reconnect it and try again."
-                        self.logConversation("[\(self.timestamp())] HEADSET: reconnect failed")
-                    }
+                    self.errorMessage = nil
+                    self.logConversation("[\(self.timestamp())] HEADSET: soft retry after capture failure")
+                    self.startListening()
                 }
             }
             recorder.onFirstTap = { [weak self] in

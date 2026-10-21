@@ -518,3 +518,18 @@ TTS 也被送到 Mac 扬声器（耳机里听不到）。耳机不在默认输�
 
 **注意**：如果耳机真的关机/超出范围，App 现在会明确报"蓝牙耳机未连接"，不会静默录虚拟麦克风。
 虚拟音频软件（Immersed / Virtual Desktop）仍可能抢默认设备；App 在关键操作前会重新 pin。
+
+**不要再自动 close/open 蓝牙连接（会制造"反复断开重连"）**
+
+日志里 capture 失败后调用 `reconnect()`（closeConnection + openConnection），设备 ID 会变化
+（214 → 250 → 283），而且重连后经常仍是 44.1 kHz / 0 回调，反而更糟；用户能听到反复断开/重连。
+
+现在的策略：
+
+* `ensureReady()` 只在**蓝牙链路本身断开**（`isConnected()==false`）时才 `openConnection()`；
+  链路还在、只是音频设备暂时没注册时，**只等待**，不拆连接。
+* `pinDefaults()` 先比较当前默认设备，只有不同才 set，避免无谓的重新配置/切换。
+* capture 失败只做**软恢复**：等 1.5s、重新 pin、重试一次；不再 close/open 蓝牙。
+* `reconnect()`（close/open）保留但不再自动调用；需要时由用户手动触发/重启 App。
+* 耳机自身在 A2DP↔HFP 之间的切换提示音是固件/蓝牙协议行为，App/驱动无法消除；
+  要完全避免只能在硬件上让耳机只承担一种角色（USB/2.4G 接收器，或独立麦克风/扬声器）。

@@ -120,8 +120,12 @@ final class HeadsetManager {
               let output = devices.first(where: { deviceName($0).uppercased().contains(fragment) && hasChannels($0, input: false) }) else {
             return false
         }
-        let inputOK = setDefault(kAudioHardwarePropertyDefaultInputDevice, input)
-        let outputOK = setDefault(kAudioHardwarePropertyDefaultOutputDevice, output)
+        // Only touch the system defaults when they actually differ. Re-setting the
+        // same device causes needless reconfiguration (and audible switching).
+        let currentInput = defaultDevice(kAudioHardwarePropertyDefaultInputDevice)
+        let currentOutput = defaultDevice(kAudioHardwarePropertyDefaultOutputDevice)
+        let inputOK = currentInput == input || setDefault(kAudioHardwarePropertyDefaultInputDevice, input)
+        let outputOK = currentOutput == output || setDefault(kAudioHardwarePropertyDefaultOutputDevice, output)
         return inputOK && outputOK
     }
 
