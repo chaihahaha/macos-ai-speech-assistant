@@ -49,12 +49,17 @@
   `play/pause` 来自**双击**（左右耳双击都发 `play/pause`，无法区分左右）。
   上一轮 24 个手势共 12 条事件的正确分解是：8 个双击 → 8 条 play/pause，
   4 个右耳三击 → 4 条 nextTrack，8 个单击 + 4 个左耳三击 → 0 条。
-* 因此：**这只耳机的可用手势是"双击"（主操作/会话开关）和"右耳三击"（`nextTrack`，绑定 TTS 语速切换）**。
+* 因此：**这只耳机的可用手势是"双击"（主操作/会话开关）和"右耳三击"（`nextTrack`）**。
   单击永远不会有反应，不是 App 的 bug。
-* 右耳三击已按要求绑定为 **TTS 语速切换**（`nextTrack → toggleTTSSpeed`）。为避免切速时把整段朗读
-  弄丢/卡死，TTS 改为显式句子队列：`ttsQueue` + `currentlySpeakingText`，一次只喂一句给
-  `AVSpeechSynthesizer`；切速时把当前句放回队首、用新语速重播，队列其余句子保留。
-  未在朗读时用独立 `speedAnnouncer` 播"快/慢"作为反馈，界面底部也会显示当前倍速。
+* 右耳三击是**上下文相关**的（`handleTriplePress`）：
+  * **Idle**：撤销上一轮对话（删除最后一条 user 消息及其后的 assistant 回复，并清掉 opencode
+    会话，确保模型上下文里也不再包含被撤销的那轮）；仍停在 Idle。
+  * **录音/识别/生成/朗读等任何进行中的状态**：切换 TTS 语速（0.5x ↔ 1.5x）。
+    为避免切速时把整段朗读弄丢/卡死，TTS 改为显式句子队列：`ttsQueue` + `currentlySpeakingText`，
+    一次只喂一句给 `AVSpeechSynthesizer`；切速时把当前句放回队首、用新语速重播，队列其余句子保留。
+    未在朗读时用独立 `speedAnnouncer` 播"快/慢"作为反馈，界面底部也会显示当前倍速。
+* **全程手动开始录音**：一轮回答结束、或被双击打断后，App 都停在 Idle，不再自动重新录音；
+  用户用双击手动进入录音状态。
 * App 必须始终是 Now Playing App，这是该耳机按键唯一的投递路径；丢掉 Now Playing 就等于
   按键全灭。旧代码里"录音引擎 = 伪装播放引擎"导致麦克风常开、蓝牙在 A2DP/HFP 间切换、
   keep-alive 引擎挂掉 —— 这是"有时候双击也没反应"的真正原因。
@@ -71,10 +76,9 @@
   按 action 去抖 0.5s（沿用原实现的经验值）；ViewModel 不再去抖。
 * **ASR 串行后台队列**：`ViewModel.asrQueue`，`Qwen3ASRModel` 非线程安全，必须串行。
 * **打断语义**：`.transcribing/.generating/.speaking` → `interruptConversation()` →
-  停止 TTS / 取消 LLM / 删除本轮未完成对话 → 0.7s 后自动回到监听。
-  0.7s 大于 0.5s 去抖窗口，避免重复投递把重启吞掉。
-* **完成语义**：一轮回答结束后先置 `.inactive` 再排重启（`enterAutoRestart`）。
-  否则在 1.0~1.5s 的间隙按媒体键会被当成"打断进行中的回答"，把刚拿到的整轮对话删掉。
+  停止 TTS / 取消 LLM / 删除本轮未完成对话 → **停在 Idle**（不再自动重开录音）。
+* **完成语义**：一轮回答结束后 `finishTurn()` 直接置 `.inactive` 并**停在 Idle**。
+  用户用双击手动开始下一轮。这样"Idle 时右耳三击撤销上一轮"才随时可用。
 * **只删本轮**：`currentTurnUserMessageID` 记录本轮 user 消息，打断时只删这一轮；
   在 `.transcribing` 阶段（user 消息还没落库）打断不会误删上一轮。
 * **TTS 句子队列**：`ttsQueue` + `currentlySpeakingText`，一次只喂一句给
@@ -98,10 +102,12 @@ swift build --disable-sandbox --build-system native   # exit 0，无 warning
 
 ### 待用户确认 / 后续可做
 
-- [ ] 真机（带媒体键的键盘 / 蓝牙耳机）回归：各状态下按 play/pause 是否都能立即打断。
-- [ ] 确认 next/previous 键是否仍应映射为「TTS 语速切换」；`handleNextTrack`（切歌/撤销）已被移除，
-      如需要可另行接线。
+- [ ] 真机回归：双击开始/停止/打断；回答结束后停在 Idle；Idle 时右耳三击撤销上一轮；
+      进行中右耳三击切语速。
 - [ ] 多段语音：VAD 第一次 `speechEnded` 就停止录音并启动静默计时，句中停顿会提前结束录音，
       属于既有设计，如需连续采集需另行改造。
 - [ ] `sendToOpencode` 里 `ensureOpencodeServer()` 最长会等 3s，这期间打断已可生效（generation 校验），
       但 UI 状态仍显示 `transcribing`。
+- [ ] 撤销上一轮时会 `opencodeClient.reset()`：因为 opencode 的服务端会话无法只删最后一轮，
+      这等于把服务端上下文整体丢弃（本地更早的消息仍保留在界面上）。如需保留更早上下文，
+      需要 opencode 提供按消息删除/回滚的 API。

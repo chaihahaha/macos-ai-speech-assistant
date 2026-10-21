@@ -142,10 +142,11 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             // all), so this is the primary talk control.
             playPause: { [weak self] in self?.handlePlayPause() },
             // EDIFIER X Fit: right-ear triple press reports as `nextTrack`.
-            // Bound to the TTS speed toggle as requested.
-            nextTrack: { [weak self] in self?.toggleTTSSpeed() },
+            // Context-sensitive: undo the last turn when idle, TTS speed while
+            // a turn is in progress.
+            nextTrack: { [weak self] in self?.handleTriplePress() },
             // Not emitted by this headset; kept for other AVRCP devices.
-            previousTrack: { [weak self] in self?.toggleTTSSpeed() }
+            previousTrack: { [weak self] in self?.handleTriplePress() }
         )
         mediaKeys.becomeNowPlaying()
     }
@@ -202,6 +203,18 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         }
         if conversationState != .inactive {
             mediaKeys.setPlaying()
+        }
+    }
+
+    /// Right-ear triple press.
+    /// - Idle: undo the last exchange (the user wants to rephrase and retry).
+    /// - Any active turn: toggle the TTS speaking rate.
+    private func handleTriplePress() {
+        print("[MediaKey] handleTriplePress, state=\(conversationState.rawValue)")
+        if conversationState == .inactive {
+            undoLastConversation()
+        } else {
+            toggleTTSSpeed()
         }
     }
 
@@ -350,7 +363,9 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         debugInfo = "Stopped"
     }
 
-    /// Stops the current generation/speech but hands control back to listening.
+    /// Stops the current generation/speech and returns to Idle.
+    /// Deliberately does **not** auto-resume listening: the user starts the next
+    /// recording manually with a double press.
     private func interruptConversation() {
         print("[MediaKey] Interrupting conversation, state=\(conversationState.rawValue)")
 
@@ -371,24 +386,26 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         conversationState = .inactive
         logStateChange(.inactive)
-        debugInfo = "Interrupted. Restarting listening..."
-        // Must stay larger than MediaKeyController's dedup window, otherwise a
-        // duplicate delivery of the interrupting press would cancel the restart.
-        scheduleStartListening(after: 0.7, reason: "interrupt")
+        mediaKeys.setPlaying()
+        debugInfo = "Interrupted (idle). Double-press to talk again."
     }
 
+    /// Undo the last user+assistant exchange. Stays Idle — the user will
+    /// rephrase and start the next recording manually.
     private func undoLastConversation() {
-        print("[MediaKey] Undoing last conversation")
+        print("[MediaKey] Undo last conversation, state=\(conversationState.rawValue)")
         stopConversation(caller: "undoLastConversation")
 
         guard let lastUser = messages.lastIndex(where: { $0.role == .user }) else {
-            scheduleStartListening(after: 0.3, reason: "undoNoMessages")
+            debugInfo = "Nothing to undo"
             return
         }
         messages.removeSubrange(lastUser...)
+        // Clear the server-side opencode session too, otherwise the removed turn
+        // would still be part of the model's context.
         opencodeClient?.reset()
-        debugInfo = "Undone. Restarting listening..."
-        scheduleStartListening(after: 0.3, reason: "undo")
+        currentSessID = nil
+        debugInfo = "Undid last turn (idle). Double-press to talk again."
     }
 
     private func removePartialExchange() {
@@ -438,20 +455,19 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         }
     }
 
-    /// The exchange is complete; mark the cycle as inactive *before* scheduling
-    /// the automatic return to listening. Otherwise a media-key press during the
-    /// short pause would be treated as "interrupt an in-flight response" and
-    /// would delete the exchange the user just received.
-    private func enterAutoRestart(after delay: TimeInterval, reason: String) {
+    /// The exchange is complete. Mark the cycle as inactive and **stay there**:
+    /// the user starts the next recording manually (double press). This also
+    /// makes "triple press while idle = undo last turn" reachable after a normal
+    /// answer.
+    private func finishTurn() {
         guard conversationState != .inactive else { return }
-        print("[VM] cycle complete, resuming listening in \(delay)s (state was \(conversationState.rawValue))")
+        print("[VM] cycle complete, going idle (state was \(conversationState.rawValue))")
         conversationState = .inactive
         logStateChange(.inactive)
         isTyping = false
         currentTurnUserMessageID = nil
-        debugInfo = "Done. Resuming listening..."
+        debugInfo = "Done (idle). Double-press to talk again."
         mediaKeys.setPlaying()
-        scheduleStartListening(after: delay, reason: reason)
     }
 
     // MARK: - Logging
@@ -533,9 +549,9 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             return
         }
         guard streamingComplete else { return }
-        print("[TTS] All utterances finished, waiting before resuming listening")
+        print("[TTS] All utterances finished, going idle")
         streamingComplete = false
-        enterAutoRestart(after: 1.5, reason: "ttsFinished")
+        finishTurn()
     }
 
     // MARK: - Model loading
@@ -807,7 +823,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         streamingComplete = true
         if currentlySpeakingText == nil && ttsQueue.isEmpty {
             streamingComplete = false
-            enterAutoRestart(after: 1.0, reason: "generationFinished")
+            finishTurn()
         }
     }
 
