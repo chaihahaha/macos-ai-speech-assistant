@@ -624,3 +624,20 @@ macOS 上不可靠（第二轮起 16k 静音、44.1k 停摆）。
   * 开始 transcribe：`Morse` 一次；
   * 超时/假结束回 idle：`Basso` 一次。
   删除了原先每秒一次的倒计时 `Tink`。
+
+**HFP 输入 16 kHz 但全 0：input-only engine 没有激活 SCO**
+
+日志：`attempt 1/3 input=1 ch, 16000 Hz`，tap 持续回调 60 秒，但每一行
+`periodPeak=0.0000`；用户说话也没有任何峰值。即 HFP 输入端点存在，但麦克风的 SCO
+音频链路没被激活。视频通话类 App 会打开 **voice processing**（VPIO，麦克风+输出，
+即"通话"路径），这才会真正激活耳机麦克风。
+
+修复：在 `AVAudioRecorder.beginCapture` 里，installTap 之前调用：
+
+```swift
+try inputNode.setVoiceProcessingEnabled(true)
+```
+
+这会启用 Apple 的 voice-processing IO（AEC/通话路径），让 HFP SCO 真正建立。
+日志会打印 `[AudioRecorder] voice processing enabled`；若抛错会打印失败原因。
+如果仍全 0，下一步是给 engine 接一个 16 kHz 的静音 player（duplex，模拟通话的双向流）。

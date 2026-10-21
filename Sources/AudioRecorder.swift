@@ -226,6 +226,15 @@ final class AudioRecorder {
         stateLock.unlock()
         lastTapChange = Date()
         let inputNode = engine.inputNode
+        // Open the voice-processing path (the same "call" path used by video
+        // chat apps). Without it the headset can expose a 16 kHz HFP input
+        // endpoint that delivers pure zeros: the SCO link is never activated.
+        do {
+            try inputNode.setVoiceProcessingEnabled(true)
+            report("[AudioRecorder] voice processing enabled")
+        } catch {
+            report("[AudioRecorder] voice processing enable failed: \(error)")
+        }
         let inputFormat = inputNode.inputFormat(forBus: 0)
         report("[AudioRecorder] attempt \(attempt)/\(Self.maxCaptureAttempts) input=\(inputFormat) defaultInput=\(defaultInputInfo())")
 

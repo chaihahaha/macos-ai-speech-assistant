@@ -120,6 +120,9 @@
 * **录音时的三击不可行**：实测即使把静音 keep-alive 放内置扬声器、App 保持 Now Playing，
   录音（HFP）期间也收不到任何 AVRCP 事件 → 耳机固件在 HFP 下不发媒体键。该方案已回退
   （还会让 TTS 路由变噪音）。录音中退出只能用界面按钮。
+* **HFP 16k 全 0**：input-only engine 可能不激活 SCO；在 beginCapture 里先
+  `inputNode.setVoiceProcessingEnabled(true)`（VPIO 通话路径）。日志确认
+  `voice processing enabled`；若仍全 0，下一步加 16k 静音 player 做 duplex。
 * **沉默≠麦克风故障**：已删除 `periodPeak==0` 的静音重试；只有 0 回调才重试。录音超时
   （可配置，设置面板）时若无语音（peak<0.003）直接回 idle；有语音才进 ASR。
 * **设置面板**：TTS 语速 slider（tts.fastRate）和录音超时（vad.maxRecordingDuration）
