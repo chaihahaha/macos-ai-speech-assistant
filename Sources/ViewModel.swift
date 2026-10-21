@@ -112,7 +112,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private var currentTurnUserMessageID: UUID?
 
     private let mediaKeys = MediaKeyController()
-    private let audioRoute = AudioRoute()
 
     override init() {
         appConfig = AppConfig.load()
@@ -368,7 +367,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         // make AVAudioEngine.start() hang or deliver zero input callbacks
         // (the device is mid A2DP<->HFP switch). ~0.6s is enough in practice.
         mediaKeys.pauseKeepAliveForRecording()
-        audioRoute.preferHFPForInput()
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 600_000_000)
             guard let self, self.isCurrent(gen), self.conversationState == .listening else {
@@ -499,7 +497,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @discardableResult
     private func stopRecordingAndResumeKeepAlive() -> [Float] {
         let samples = recorder?.stopRecording() ?? []
-        audioRoute.restoreOutputRate()
         mediaKeys.resumeKeepAliveAfterRecording()
         return samples
     }
