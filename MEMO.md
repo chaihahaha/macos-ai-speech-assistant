@@ -103,10 +103,17 @@
 ### 验证
 
 ```bash
-swift build --disable-sandbox --build-system native   # exit 0，无 warning
+swift build --disable-sandbox --build-system native \
+  -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Sources/Info.plist
+codesign --entitlements Sources/LlamaStreamingDemo.entitlements --force -s - .build/debug/MyLlamaSpeechAssistant
+otool -s __TEXT __info_plist .build/debug/MyLlamaSpeechAssistant   # 必须能看到 section 内容
 ```
 
-注意：默认 `swift build` 会因 mlx-swift 的 Metal kernel 编译失败，见 `PITFALL.md` 第 1 节。
+注意：
+- 默认 `swift build` 会因 mlx-swift 的 Metal kernel 编译失败，见 `PITFALL.md` 第 1 节。
+- **`-sectcreate` 参数不能省**：它把 `Sources/Info.plist`（含 `NSMicrophoneUsageDescription`）
+  嵌进二进制；省掉后 `AVAudioEngine` 照常启动但 input tap 永远没有回调，界面会卡在
+  `listening`。见 `PITFALL.md` 第 10 节。
 
 ### 待用户确认 / 后续可做
 

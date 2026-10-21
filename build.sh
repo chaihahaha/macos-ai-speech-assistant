@@ -8,7 +8,12 @@ echo "=== Building MyLlamaSpeechAssistant ==="
 
 # Step 1: Build (SwiftPM fetches mlx-swift, swift-transformers, etc. from GitHub)
 echo "[1/3] Building (fetching dependencies + compiling)..."
-swift build --disable-sandbox -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Sources/Info.plist
+# NOTE: --build-system native is required on this toolchain (the default
+# swiftbuild system fails compiling mlx-swift's Metal kernels).
+# NOTE: the -sectcreate flags embed Sources/Info.plist into the binary; without
+# them macOS will not grant microphone access and the audio tap stays silent.
+swift build --disable-sandbox --build-system native \
+    -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Sources/Info.plist
 
 BUILD_DIR="${SCRIPT_DIR}/.build"
 ARCH="$(uname -m)-apple-macosx"

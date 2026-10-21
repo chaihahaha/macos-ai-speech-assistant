@@ -206,3 +206,54 @@ tap 回调先检查 active 标志，停止后立即返回。
    `[LlamaCpp] HTTP ...`。
 3. 直接 `curl -s http://127.0.0.1:8080/v1/models` 确认后端；opencode 则
    `curl -s http://127.0.0.1:9999/global/health`。
+
+---
+
+## 10. `swift build` 不带 `-sectcreate` → 二进制缺少内嵌 Info.plist → 麦克风静默失效
+
+**现象**
+
+界面一直停在 `listening`，日志里只有：
+
+```
+[AudioRecorder] input format=<AVAudioFormat ... 1 ch, 16000 Hz, Float32>
+[AudioRecorder] engine started
+[AudioRecorder] capture started (AVAudioEngine tap)
+（之后没有 TAP / VAD / 任何状态变化）
+```
+
+即 `AVAudioEngine` 能启动，但 input tap **一次回调都没有**。用户会以为"崩溃了/没反应"，
+实际上要等 `maxRecordingDuration`（默认 60s）才会自动停。
+
+**原因**
+
+`Sources/Info.plist` 里有 `NSMicrophoneUsageDescription`，`build.sh` 通过
+`-Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Sources/Info.plist`
+把它嵌进可执行文件。用普通 `swift build` 重新链接时**没有带这些参数**，内嵌 section 就消失了：
+
+```bash
+otool -s __TEXT __info_plist .build/debug/MyLlamaSpeechAssistant
+# 修复前：只有一行文件名，没有 "Contents of (__TEXT,__info_plist) section"
+```
+
+没有 `NSMicrophoneUsageDescription` 时，macOS 不会弹权限框，也不会把麦克风数据交给进程，
+但 `AVAudioEngine.start()` 仍然返回成功 —— 于是表现为"启动正常、永远收不到音频"。
+（每次 `codesign -s -` 重新签名还会改变代码身份，TCC 授权可能被重置，更容易踩到。）
+
+**修复**
+
+```bash
+swift build --disable-sandbox --build-system native \
+  -Xlinker -sectcreate -Xlinker __TEXT \
+  -Xlinker __info_plist -Xlinker Sources/Info.plist
+codesign --entitlements Sources/LlamaStreamingDemo.entitlements --force -s - \
+  .build/debug/MyLlamaSpeechAssistant
+otool -s __TEXT __info_plist .build/debug/MyLlamaSpeechAssistant   # 必须能看到 section 内容
+```
+
+`build.sh` 已补上 `--build-system native`（默认 swiftbuild 会因 mlx-swift Metal kernel 失败）。
+另外 `ViewModel.ensureMicrophonePermission()` 现在会显式检查 `AVCaptureDevice.authorizationStatus`
+并在 `.notDetermined` 时请求权限；被拒绝时界面顶部会显示红色错误。
+
+**排查口诀**：`listening` 卡住 + 没有 `TAP: first callback` → 先查内嵌 Info.plist，再查
+系统设置里的麦克风授权。

@@ -259,8 +259,40 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
     // MARK: - State transitions
 
+    /// Returns `false` when recording must not start (permission missing or
+    /// pending). When undetermined, asks macOS to prompt and retries
+    /// `startListening()` after the user answers.
+    private func ensureMicrophonePermission() -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            return true
+        case .notDetermined:
+            debugInfo = "Waiting for microphone permission…"
+            logConversation("[\(timestamp())] MIC: requesting permission")
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if granted {
+                        self.logConversation("[\(self.timestamp())] MIC: granted")
+                        self.startListening()
+                    } else {
+                        self.errorMessage = "Microphone access was denied. Enable it in System Settings ▸ Privacy & Security ▸ Microphone."
+                        self.logConversation("[\(self.timestamp())] MIC: denied")
+                    }
+                }
+            }
+            return false
+        default:
+            errorMessage = "Microphone access denied. Enable it in System Settings ▸ Privacy & Security ▸ Microphone."
+            logConversation("[\(timestamp())] MIC: denied/restricted")
+            return false
+        }
+    }
+
     func startListening() {
         mediaKeys.setPlaying()
+
+        guard ensureMicrophonePermission() else { return }
 
         guard asrModel != nil, recorder != nil else {
             debugInfo = "Models are still loading..."
