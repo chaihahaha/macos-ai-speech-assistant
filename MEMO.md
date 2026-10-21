@@ -124,6 +124,10 @@
   一半/幻觉；不要再用。判断静音用整段 RMS（<0.003）而不是 peak。
 * **等待期间继续采集**：VAD end 不再立刻 finishCapture；`onSpeechStarted` 取消发送并继续
   收集，避免一句话只识别前半段。
+* **最终采集方案：AVCaptureSession**：AVAudioEngine 在这只耳机上无解（input-only 全 0、
+  duplex 0 回调、VPIO 压电平）。AVCaptureSession（视频通话同款路径）实测 5 秒 250 buffer、
+  peak 0.37。`AudioRecorder` 已重写为 AVCaptureSession，16k mono Float32，会话跨轮保持。
+  不要再回到 AVAudioEngine/VPIO/duplex。
 * **HFP 16k 全 0 → duplex**：input-only 不激活 SCO。现在在录音 engine 上再 attach 一个
   16k 单声道静音 player（volume 0，loop），让耳机看到双向流（等价通话）。日志打印
   duplex player/outputNode 格式；若 outputNode=44.1k 且 peak 仍 0，下一步强制 HFP 16k。

@@ -1,83 +1,51 @@
 import AVFoundation
+import CoreMedia
 import Foundation
-import CoreAudio
 import SpeechVAD
 
-/// Captures microphone audio through an `AVAudioEngine` tap, converts it to
-/// 16 kHz mono float samples and feeds it to the streaming VAD.
-///
-/// Hard-won lessons (see PITFALL.md #11/#12):
-/// * only **one** `AVAudioEngine` may run in the process (a silent Now-Playing
-///   output engine started first starves the input tap entirely);
-/// * after the Bluetooth profile switches A2DP ↔ HFP, the first capture attempt
-///   can bind to the wrong input endpoint (e.g. 44.1 kHz instead of the
-///   headset's 16 kHz HFP) and then the tap never fires. We therefore watch for
-///   a silent tap and retry with a **fresh engine** after a short settle delay;
-/// * graph mutations (attach/connect) must happen before `engine.start()`.
-final class AudioRecorder {
+/// Captures microphone audio through `AVCaptureSession` — the same audio path
+/// used by video-conferencing apps. `AVAudioEngine` was fundamentally unable to
+/// use this headset's HFP microphone: input-only delivered 16 kHz zeros, a
+/// duplex engine delivered zero callbacks, and voice processing attenuated the
+/// signal. `AVCaptureSession` activates the HFP/SCO link correctly.
+final class AudioRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private(set) var isRecording = false
     private(set) var audioLevel: Float = 0
 
-    /// True when the HFP capture engine is still running between turns.
-    var isEngineRunning: Bool { engine.isRunning && tapInstalled }
+    /// True when the HFP capture session is still running between turns.
+    var isEngineRunning: Bool { session?.isRunning == true }
 
     var onSpeechEnded: (() -> Void)?
-    /// Called when the VAD detects speech again (used to cancel the silence
-    /// countdown while the user is still talking).
     var onSpeechStarted: (() -> Void)?
-    /// Called once when the first audio buffer arrives (capture is really alive).
-    /// The ViewModel uses this to start the silent Now-Playing engine *after*
-    /// the input engine, which avoids the output-first starvation.
+    /// Called once per capture when the first audio buffer arrives.
     var onFirstTap: (() -> Void)?
-    /// Called when every capture attempt failed (no input callbacks at all).
     var onCaptureFailed: (() -> Void)?
-    /// Diagnostics sink (the ViewModel writes these into the conversation log).
     var onLog: ((String) -> Void)?
 
-    /// Recreated for every capture attempt.
-    private var engine = AVAudioEngine()
-    /// A silent player kept on the SAME engine as the input tap. It gives the
-    /// headset an active output stream as well, which is what makes the HFP/SCO
-    /// microphone actually deliver audio (a call is bidirectional; input-only
-    /// engines can expose a 16 kHz endpoint that only returns zeros).
-    private var silentPlayer: AVAudioPlayerNode?
-    private var samples: [Float] = []
-    /// Peak absolute sample seen since `startRecording()` (guarded by `sampleLock`).
-    private var peak: Float = 0
-    /// Protects `samples` / `peak`.
-    private let sampleLock = NSLock()
-    /// Protects `vadProcessor` (touched from the audio thread and from main).
-    private let vadLock = NSLock()
-    /// Protects `isRecording` / `tapFireCount` / `captureToken`.
-    private let stateLock = NSLock()
     private let targetSampleRate: Double
-
     private let vadProcessor: StreamingVADProcessor
-    private var speechActive = false
-    private var tapFireCount: Int = 0
-    private var tapInstalled = false
-    /// Incremented on every start/stop so stale retries and stale taps are ignored.
+
+    private var session: AVCaptureSession?
+    private var output: AVCaptureAudioDataOutput?
+    private let sessionQueue = DispatchQueue(label: "AudioRecorder.session")
+    private let audioQueue = DispatchQueue(label: "AudioRecorder.audio")
+
+    private var samples: [Float] = []
+    private var peak: Float = 0
+    private let sampleLock = NSLock()
+    private let vadLock = NSLock()
+    private let stateLock = NSLock()
+
+    private var bufferCount = 0
+    private var didReportFirstBuffer = false
     private var captureToken = 0
-
-    private static let maxCaptureAttempts = 3
-    /// Settle time between a failed attempt and the next one.
-    private static let retryDelay: TimeInterval = 0.5
-    private static let stallCheckInterval: TimeInterval = 0.5
-    private static let firstTapTimeout: TimeInterval = 1.0
-    private static let stallTimeout: TimeInterval = 1.2
-
-    private var stallTimer: Timer?
-    private var currentAttempt = 0
-    private var lastObservedTapCount = 0
-    private var lastTapChange = Date()
-    /// Peak since the last periodic check (guarded by sampleLock).
-    private var periodPeak: Float = 0
-    private var consecutiveZeroPeakChecks = 0
-    private var stallCheckTicks = 0
+    private var speechActive = false
+    private var firstBufferWatchdog: DispatchWorkItem?
 
     init(targetSampleRate: Double = 16000, vadProcessor: StreamingVADProcessor) {
         self.targetSampleRate = targetSampleRate
         self.vadProcessor = vadProcessor
+        super.init()
     }
 
     private func report(_ message: String) {
@@ -96,42 +64,29 @@ final class AudioRecorder {
             report("[AudioRecorder] startRecording ignored (already recording)")
             return
         }
-        let reuse = tapInstalled && engine.isRunning
-        stateLock.unlock()
-        if reuse {
-            resumeCapture()
-            return
-        }
-        stateLock.lock()
         isRecording = true
-        tapFireCount = 0
         captureToken &+= 1
         let token = captureToken
+        bufferCount = 0
+        didReportFirstBuffer = false
         stateLock.unlock()
-
-        report("[AudioRecorder] startRecording called, engine.running=\(engine.isRunning)")
 
         sampleLock.lock()
         samples.removeAll()
         peak = 0
-        periodPeak = 0
         sampleLock.unlock()
-        consecutiveZeroPeakChecks = 0
-        stallCheckTicks = 0
 
         speechActive = false
         vadLock.lock()
         vadProcessor.reset()
         vadLock.unlock()
-        report("[AudioRecorder] VAD reset")
 
-        startStallMonitor()
-        beginCapture(token: token, attempt: 1)
+        report("[AudioRecorder] startRecording (AVCaptureSession)")
+        startSessionIfNeeded(token: token)
     }
 
-    /// End the current utterance but **keep the HFP engine/tap running**, so the
-    /// headset stays in one profile and the next turn does not renegotiate
-    /// A2DP -> HFP (which is what made capture fail after a few turns).
+    /// End the utterance but keep the capture session running so the headset
+    /// stays in HFP and the next turn needs no profile switch.
     @discardableResult
     func finishCapture() -> [Float] {
         stateLock.lock()
@@ -140,300 +95,224 @@ final class AudioRecorder {
             return []
         }
         isRecording = false
-        let fireCount = tapFireCount
+        let count = bufferCount
         stateLock.unlock()
-
-        stallTimer?.invalidate()
-        stallTimer = nil
+        firstBufferWatchdog?.cancel()
+        firstBufferWatchdog = nil
 
         sampleLock.lock()
         let result = samples
-        let count = result.count
         let peakValue = peak
         samples.removeAll()
         peak = 0
         sampleLock.unlock()
-        report("[AudioRecorder] capture finished (engine kept alive): \(count) samples (\(String(format: "%.2f", Double(count) / targetSampleRate))s), peak=\(String(format: "%.4f", peakValue)), tapFireCount=\(fireCount)")
+        report("[AudioRecorder] capture finished (session kept alive): \(result.count) samples, peak=\(String(format: "%.4f", peakValue)), buffers=\(count)")
         return result
     }
 
-    /// Resume collecting on the already-running HFP engine.
     func resumeCapture() {
         stateLock.lock()
-        let canResume = !isRecording && tapInstalled && engine.isRunning
+        let canResume = !isRecording && session?.isRunning == true
+        if canResume {
+            isRecording = true
+            captureToken &+= 1
+            bufferCount = 0
+            didReportFirstBuffer = false
+        }
+        let token = captureToken
         stateLock.unlock()
+
         guard canResume else {
-            report("[AudioRecorder] resumeCapture: engine not reusable, starting fresh")
             startRecording()
             return
         }
 
-        stateLock.lock()
-        isRecording = true
-        tapFireCount = 0
-        // Do NOT change captureToken: the installed tap captured the old token.
-        currentAttempt = 1
-        lastObservedTapCount = 0
-        stateLock.unlock()
-        lastTapChange = Date()
-
         sampleLock.lock()
         samples.removeAll()
         peak = 0
-        periodPeak = 0
         sampleLock.unlock()
-        consecutiveZeroPeakChecks = 0
-        stallCheckTicks = 0
-
         speechActive = false
         vadLock.lock()
         vadProcessor.reset()
         vadLock.unlock()
-        startStallMonitor()
-        report("[AudioRecorder] capture resumed on existing HFP engine")
+        report("[AudioRecorder] capture resumed on existing session")
+        startFirstBufferWatchdog(token: token)
     }
 
     @discardableResult
     func stopRecording() -> [Float] {
         stateLock.lock()
-        // Tear down even if the last utterance was already finished with
-        // finishCapture() (which keeps the engine alive for the next turn).
-        // Otherwise the HFP engine would stay open forever at idle.
         isRecording = false
-        captureToken &+= 1 // invalidate any pending retry / watchdog
-        let fireCount = tapFireCount
+        captureToken &+= 1
+        let count = bufferCount
         stateLock.unlock()
+        firstBufferWatchdog?.cancel()
+        firstBufferWatchdog = nil
 
-        stallTimer?.invalidate()
-        stallTimer = nil
-        teardownEngine()
+        if let session, session.isRunning {
+            sessionQueue.async { session.stopRunning() }
+        }
+        session = nil
+        output = nil
 
         sampleLock.lock()
         let result = samples
-        let count = result.count
-        let peakValue = peak
         samples.removeAll()
         peak = 0
         sampleLock.unlock()
-        report("[AudioRecorder] stopped: \(count) samples (\(String(format: "%.2f", Double(count) / targetSampleRate))s), peak=\(String(format: "%.4f", peakValue)), tapFireCount=\(fireCount)")
+        report("[AudioRecorder] stopped (session torn down): \(result.count) samples, buffers=\(count)")
         return result
     }
 
-    // MARK: - Capture lifecycle
+    // MARK: - Session
 
-    private func beginCapture(token: Int, attempt: Int) {
-        guard isCurrentCapture(token) else { return }
-
-        // Fresh engine for every attempt: a reused engine can keep the previous
-        // (wrong) input format/endpoint after a Bluetooth profile switch.
-        engine = AVAudioEngine()
-        tapInstalled = false
-        currentAttempt = attempt
-        stateLock.lock()
-        lastObservedTapCount = tapFireCount
-        stateLock.unlock()
-        lastTapChange = Date()
-        let inputNode = engine.inputNode
-        let inputFormat = inputNode.inputFormat(forBus: 0)
-        report("[AudioRecorder] attempt \(attempt)/\(Self.maxCaptureAttempts) input=\(inputFormat) defaultInput=\(defaultInputInfo())")
-
-        guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
-            report("[AudioRecorder] no usable microphone format")
-            scheduleRetry(token: token, attempt: attempt, reason: "invalid input format")
+    private func startSessionIfNeeded(token: Int) {
+        if let session, session.isRunning {
+            startFirstBufferWatchdog(token: token)
+            report("[AudioRecorder] capture started (reused running session)")
             return
         }
 
-        guard let recordingFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                                  sampleRate: targetSampleRate,
-                                                  channels: 1,
-                                                  interleaved: false),
-              let converter = AVAudioConverter(from: inputFormat, to: recordingFormat) else {
-            report("[AudioRecorder] failed to create converter \(inputFormat) -> \(targetSampleRate)Hz mono")
-            scheduleRetry(token: token, attempt: attempt, reason: "converter creation failed")
+        guard configureSessionIfNeeded() else {
+            failCapture()
             return
         }
+        guard let session else {
+            failCapture()
+            return
+        }
+        startFirstBufferWatchdog(token: token)
+        report("[AudioRecorder] capture started (AVCaptureSession)")
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            session.startRunning()
+            let running = session.isRunning
+            self.report("[AudioRecorder] session.startRunning done, running=\(running)")
+            if !running {
+                DispatchQueue.main.async { [weak self] in self?.failCapture() }
+            }
+        }
+    }
 
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
+    private func configureSessionIfNeeded() -> Bool {
+        if session != nil { return true }
+        let devices = AVCaptureDevice.DiscoverySession(deviceTypes: [.microphone], mediaType: .audio, position: .unspecified).devices
+        let device = devices.first(where: { $0.localizedName.uppercased().contains("EDIFIER") }) ?? AVCaptureDevice.default(for: .audio)
+        guard let device else {
+            report("[AudioRecorder] no audio capture device")
+            return false
+        }
+        let session = AVCaptureSession()
+        session.beginConfiguration()
+        do {
+            let input = try AVCaptureDeviceInput(device: device)
+            guard session.canAddInput(input) else {
+                report("[AudioRecorder] cannot add input \(device.localizedName)")
+                return false
+            }
+            session.addInput(input)
+        } catch {
+            report("[AudioRecorder] device input failed: \(error)")
+            return false
+        }
+
+        let output = AVCaptureAudioDataOutput()
+        output.audioSettings = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: targetSampleRate,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsNonInterleaved: false,
+        ]
+        output.setSampleBufferDelegate(self, queue: audioQueue)
+        guard session.canAddOutput(output) else {
+            report("[AudioRecorder] cannot add audio output")
+            return false
+        }
+        session.addOutput(output)
+        session.commitConfiguration()
+        self.session = session
+        self.output = output
+        report("[AudioRecorder] configured device=\(device.localizedName)")
+        return true
+    }
+
+    private func startFirstBufferWatchdog(token: Int) {
+        firstBufferWatchdog?.cancel()
+        let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.stateLock.lock()
             let active = self.isRecording && token == self.captureToken
+            let count = self.bufferCount
             self.stateLock.unlock()
-            guard active else { return }
-            self.handleTap(buffer: buffer, converter: converter, recordingFormat: recordingFormat)
+            guard active, count == 0 else { return }
+            self.report("[AudioRecorder] no audio buffers after 4s")
+            self.failCapture()
         }
-        tapInstalled = true
-
-        // Duplex: add a silent output stream to activate the headset mic (SCO).
-        let playerFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                         sampleRate: targetSampleRate,
-                                         channels: 1,
-                                         interleaved: false) ?? recordingFormat
-        let player = AVAudioPlayerNode()
-        engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: playerFormat)
-        silentPlayer = player
-        report("[AudioRecorder] duplex silent player format=\(playerFormat), outputNode=\(engine.outputNode.inputFormat(forBus: 0))")
-
-        if let silence = AVAudioPCMBuffer(pcmFormat: playerFormat, frameCapacity: 1024) {
-            player.scheduleBuffer(silence, at: nil, options: .loops)
-            player.volume = 0.0
-        }
-
-        do {
-            try engine.start()
-            player.play()
-            report("[AudioRecorder] engine started")
-        } catch {
-            report("[AudioRecorder] engine start failed: \(error)")
-            scheduleRetry(token: token, attempt: attempt, reason: "engine start failed")
-            return
-        }
-
-        report("[AudioRecorder] capture started (AVAudioEngine tap)")
+        firstBufferWatchdog = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0, execute: work)
     }
 
-    private func scheduleRetry(token: Int, attempt: Int, reason: String) {
-        guard isCurrentCapture(token) else { return }
-        teardownEngine()
-
-        guard attempt < Self.maxCaptureAttempts else {
-            report("[AudioRecorder] capture failed after \(attempt) attempts (\(reason))")
-            stallTimer?.invalidate()
-            stallTimer = nil
-            stateLock.lock()
-            isRecording = false
-            captureToken &+= 1
+    private func failCapture() {
+        stateLock.lock()
+        guard isRecording else {
             stateLock.unlock()
-            DispatchQueue.main.async { [weak self] in
-                self?.onCaptureFailed?()
-            }
             return
         }
-
-        report("[AudioRecorder] retrying capture in \(Self.retryDelay)s (attempt \(attempt) failed: \(reason))")
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.retryDelay) { [weak self] in
-            guard let self, self.isCurrentCapture(token) else { return }
-            self.beginCapture(token: token, attempt: attempt + 1)
+        isRecording = false
+        captureToken &+= 1
+        stateLock.unlock()
+        firstBufferWatchdog?.cancel()
+        firstBufferWatchdog = nil
+        DispatchQueue.main.async { [weak self] in
+            self?.onCaptureFailed?()
         }
     }
 
-    private func startStallMonitor() {
-        stallTimer?.invalidate()
-        stallTimer = Timer.scheduledTimer(withTimeInterval: Self.stallCheckInterval, repeats: true) { [weak self] _ in
-            self?.checkForStall()
-        }
-    }
+    // MARK: - AVCaptureAudioDataOutputSampleBufferDelegate
 
-    /// The input engine can deliver one buffer and then silently stop (e.g. the
-    /// Bluetooth device reconfigures). Detect stalls in the middle of a
-    /// recording, not just at start, and recreate the engine.
-    private func checkForStall() {
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         stateLock.lock()
         let active = isRecording
-        let count = tapFireCount
-        let token = captureToken
+        let isFirst = !didReportFirstBuffer && active
+        if isFirst { didReportFirstBuffer = true; bufferCount = 0 }
+        if active { bufferCount += 1 }
         stateLock.unlock()
         guard active else { return }
 
-        sampleLock.lock()
-        let observedPeak = periodPeak
-        periodPeak = 0
-        sampleLock.unlock()
-
-        stallCheckTicks += 1
-        if stallCheckTicks % 4 == 0 {
-            report("[AudioRecorder] level taps=\(count) periodPeak=\(String(format: "%.4f", observedPeak)) engineRunning=\(engine.isRunning)")
-        }
-
-        if count != lastObservedTapCount {
-            lastObservedTapCount = count
-            lastTapChange = Date()
-            if observedPeak > 0 {
-                consecutiveZeroPeakChecks = 0
-            } else {
-                consecutiveZeroPeakChecks += 1
+        if isFirst {
+            var description = "unknown"
+            if let fd = CMSampleBufferGetFormatDescription(sampleBuffer),
+               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd)?.pointee {
+                description = "\(asbd.mSampleRate) Hz, \(asbd.mChannelsPerFrame) ch"
             }
-            // NOTE: do NOT treat silence as a dead microphone. With the
-            // persistent HFP session the user may simply be quiet for a while;
-            // tearing the engine down here caused the retry/beep/"headset not
-            // connected" cascade. Only zero callbacks (checked below) mean the
-            // engine is dead.
-            return
+            report("[AudioRecorder] TAP: first buffer (\(description))")
+            DispatchQueue.main.async { [weak self] in self?.onFirstTap?() }
         }
 
-        let elapsed = Date().timeIntervalSince(lastTapChange)
-        let timeout = count == 0 ? Self.firstTapTimeout : Self.stallTimeout
-        guard elapsed > timeout else { return }
-
-        report("[AudioRecorder] input stalled for \(String(format: "%.1f", elapsed))s (callbacks=\(count)); restarting capture")
-        lastTapChange = Date()
-        scheduleRetry(token: token, attempt: currentAttempt, reason: "tap stalled")
-    }
-
-    private func teardownEngine() {
-        silentPlayer?.stop()
-        silentPlayer = nil
-        if tapInstalled {
-            engine.inputNode.removeTap(onBus: 0)
-            tapInstalled = false
+        guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+        var length = 0
+        var pointer: UnsafeMutablePointer<Int8>?
+        guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &pointer) == noErr,
+              let pointer else { return }
+        let floatCount = length / MemoryLayout<Float>.size
+        guard floatCount > 0 else { return }
+        let data = pointer.withMemoryRebound(to: Float.self, capacity: floatCount) {
+            Array(UnsafeBufferPointer(start: $0, count: floatCount))
         }
-        engine.stop()
-        engine.reset()
-    }
-
-    private func isCurrentCapture(_ token: Int) -> Bool {
-        stateLock.lock()
-        let ok = isRecording && token == captureToken
-        stateLock.unlock()
-        return ok
-    }
-
-    // MARK: - Audio
-
-    /// Runs on the audio render thread.
-    private func handleTap(buffer: AVAudioPCMBuffer, converter: AVAudioConverter, recordingFormat: AVAudioFormat) {
-        stateLock.lock()
-        tapFireCount += 1
-        let fireCount = tapFireCount
-        stateLock.unlock()
-
-        if fireCount == 1 {
-            report("[AudioRecorder] TAP: first callback, sampleRate=\(buffer.format.sampleRate), channels=\(buffer.format.channelCount)")
-            DispatchQueue.main.async { [weak self] in
-                self?.onFirstTap?()
-            }
-        }
-
-        let inputFormat = buffer.format
-        let targetFrameCount = AVAudioFrameCount(Double(buffer.frameLength) * recordingFormat.sampleRate / inputFormat.sampleRate)
-        guard targetFrameCount > 0,
-              let converted = AVAudioPCMBuffer(pcmFormat: recordingFormat, frameCapacity: targetFrameCount) else {
-            return
-        }
-
-        var error: NSError?
-        let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
-            outStatus.pointee = .haveData
-            return buffer
-        }
-        converter.convert(to: converted, error: &error, withInputFrom: inputBlock)
-
-        guard let channelData = converted.floatChannelData else { return }
-        let floatPtr = channelData[0]
-        let data = Array(UnsafeBufferPointer(start: floatPtr, count: Int(converted.frameLength)))
-        guard !data.isEmpty else { return }
 
         var sum: Float = 0
-        for s in data { sum += s * s }
-        let rms = sqrt(sum / max(Float(data.count), 1))
-
         var bufferPeak: Float = 0
-        for s in data { bufferPeak = max(bufferPeak, abs(s)) }
+        for sample in data {
+            sum += sample * sample
+            bufferPeak = max(bufferPeak, abs(sample))
+        }
+        let rms = sqrt(sum / max(Float(data.count), 1))
 
         sampleLock.lock()
         samples.append(contentsOf: data)
         peak = max(peak, bufferPeak)
-        periodPeak = max(periodPeak, bufferPeak)
         sampleLock.unlock()
 
         DispatchQueue.main.async { [weak self] in
@@ -443,72 +322,17 @@ final class AudioRecorder {
         vadLock.lock()
         let events = vadProcessor.process(samples: data)
         vadLock.unlock()
-
         for event in events {
             switch event {
             case .speechStarted(let time):
                 report("[VAD] Speech started at \(String(format: "%.2f", time))s")
-                self.speechActive = true
-                DispatchQueue.main.async { [weak self] in
-                    self?.onSpeechStarted?()
-                }
+                speechActive = true
+                DispatchQueue.main.async { [weak self] in self?.onSpeechStarted?() }
             case .speechEnded(let segment):
                 report("[VAD] Speech ended at \(String(format: "%.2f", segment.endTime))s (duration: \(String(format: "%.2f", segment.duration))s)")
-                self.speechActive = false
-                DispatchQueue.main.async { [weak self] in
-                    self?.onSpeechEnded?()
-                }
+                speechActive = false
+                DispatchQueue.main.async { [weak self] in self?.onSpeechEnded?() }
             }
         }
-    }
-
-    deinit {
-        stallTimer?.invalidate()
-        stallTimer = nil
-        stateLock.lock()
-        isRecording = false
-        captureToken &+= 1
-        stateLock.unlock()
-        if tapInstalled {
-            engine.inputNode.removeTap(onBus: 0)
-            tapInstalled = false
-        }
-        engine.stop()
-    }
-
-    /// Diagnostics: which device does AVAudioEngine actually use as input?
-    private func defaultInputInfo() -> String {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultInputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var device = AudioDeviceID(0)
-        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-        let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device)
-        guard status == noErr, device != 0 else { return "none" }
-
-        var nameAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioObjectPropertyName,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var name: Unmanaged<CFString>?
-        var nameSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
-        let nameStatus = withUnsafeMutablePointer(to: &name) { pointer in
-            AudioObjectGetPropertyData(device, &nameAddress, 0, nil, &nameSize, pointer)
-        }
-        let deviceName = (nameStatus == noErr ? name?.takeUnretainedValue() as String? : nil) ?? "?"
-
-        var rateAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioDevicePropertyScopeInput,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var rate: Float64 = 0
-        var rateSize = UInt32(MemoryLayout<Float64>.size)
-        let rateStatus = AudioObjectGetPropertyData(device, &rateAddress, 0, nil, &rateSize, &rate)
-        let rateText = rateStatus == noErr ? String(format: "%.0f", rate) : "?"
-        return "\(deviceName) id=\(device) sr=\(rateText)"
     }
 }

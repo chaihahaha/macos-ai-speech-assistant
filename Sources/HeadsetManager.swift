@@ -16,6 +16,8 @@ final class HeadsetManager {
     /// Case-insensitive fragment of the paired device name.
     var nameFragment = "EDIFIER"
 
+    private var savedOutputRate: Float64?
+
     private init() {}
 
     private var pairedDevice: IOBluetoothDevice? {
@@ -98,6 +100,64 @@ final class HeadsetManager {
         var id = device
         let size = UInt32(MemoryLayout<AudioDeviceID>.size)
         return AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, size, &id) == noErr
+    }
+
+    private func defaultOutputDevice() -> AudioDeviceID {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var device = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device)
+        return device
+    }
+
+    private func nominalRate(_ device: AudioDeviceID) -> Float64 {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var rate: Float64 = 0
+        var size = UInt32(MemoryLayout<Float64>.size)
+        AudioObjectGetPropertyData(device, &address, 0, nil, &size, &rate)
+        return rate
+    }
+
+    @discardableResult
+    private func setNominalRate(_ device: AudioDeviceID, _ rate: Float64) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value = rate
+        let size = UInt32(MemoryLayout<Float64>.size)
+        return AudioObjectSetPropertyData(device, &address, 0, nil, size, &value) == noErr
+    }
+
+    /// Force the headset output into HFP (16 kHz) so a duplex engine can open
+    /// the microphone's SCO link instead of binding to A2DP (44.1 kHz).
+    func forceHFPOutput() {
+        let output = defaultOutputDevice()
+        guard output != 0 else { return }
+        let current = nominalRate(output)
+        guard current > 0, current != 16000 else { return }
+        savedOutputRate = current
+        let ok = setNominalRate(output, 16000)
+        print("[Headset] force HFP output rate \(Int(current)) -> 16000 ok=\(ok)")
+    }
+
+    /// Restore the A2DP output rate when the conversation ends.
+    func restoreOutputRate() {
+        defer { savedOutputRate = nil }
+        guard let saved = savedOutputRate else { return }
+        let output = defaultOutputDevice()
+        guard output != 0 else { return }
+        let ok = setNominalRate(output, saved)
+        print("[Headset] restore output rate \(Int(saved)) ok=\(ok)")
     }
 
     // MARK: - Public API

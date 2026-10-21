@@ -342,7 +342,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         conversationState = .listening
         logStateChange(.listening)
-        SoundFeedback.start()
         errorMessage = nil
         debugInfo = "Listening... (\(Int(appConfig.vad.silenceTimeout))s silence to send)"
 
@@ -563,8 +562,14 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @discardableResult
     private func stopRecordingFullyAndResumeA2DP() -> [Float] {
         let samples = recorder?.stopRecording() ?? []
+        headset.restoreOutputRate()
         _ = headset.pinDefaults()
-        mediaKeys.resumeKeepAliveAfterRecording()
+        // Give the device a moment to fall back to A2DP 44.1 kHz before we
+        // start the keep-alive engine (otherwise it pins HFP 16 kHz).
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            self?.mediaKeys.resumeKeepAliveAfterRecording()
+        }
         return samples
     }
 
@@ -772,6 +777,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             recorder.onFirstTap = { [weak self] in
                 Task { @MainActor [weak self] in
                     self?.captureRecoveryAttempts = 0
+                    SoundFeedback.start()
                 }
             }
             self.recorder = recorder

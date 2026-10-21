@@ -679,3 +679,28 @@ try inputNode.setVoiceProcessingEnabled(true)
 
 然后看 `level periodPeak` 是否变成 0.0x。若 outputNode 仍是 44.1 kHz 且 peak 仍为 0，
 下一步需要把耳机输出强制到 16 kHz/HFP（CoreAudio nominal rate）后再建 duplex engine。
+
+---
+
+## 22. 结论：AVAudioEngine 用不了这只耳机的 HFP 麦克风，改用 AVCaptureSession
+
+系统性验证（同一只 EDIFIER、同样已 pin 到默认设备）：
+
+| 方案 | 结果 |
+| --- | --- |
+| input-only AVAudioEngine | 16 kHz、tap 持续回调，但 `periodPeak` 全 0（SCO 没激活） |
+| input+16k 静音 player（duplex） | outputNode 16 kHz，但 input **0 回调**（引擎互相饿死） |
+| `setVoiceProcessingEnabled(true)` | 有回调，但电平被压到 0.0003–0.005，只识别半句/幻觉 |
+| **AVCaptureSession** | **5 秒 250 个 buffer，peak 0.366** |
+
+视频通话类 App 用的是 AVCaptureSession/系统通话路径，不是 AVAudioEngine。已把
+`AudioRecorder` 重写为：
+
+* `AVCaptureSession` + `AVCaptureDeviceInput`（显式选 EDIFIER）+ `AVCaptureAudioDataOutput`
+* `audioSettings` 直接要 16 kHz、单声道、Float32
+* delegate 回调里直接拿 PCM 送 VAD；首 buffer 时播 `Pop` 提示音
+* 会话跨轮保持运行（`finishCapture` 不停 session，`startRecording` 复用），
+  只有 idle/退出才 `stopRunning`
+* 4 秒无首 buffer 才报 capture failed
+
+不要再回到 AVAudioEngine / VPIO / duplex / 强制采样率这些路径。
