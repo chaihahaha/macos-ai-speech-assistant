@@ -470,3 +470,14 @@ attempt 3/3 input=44.1 kHz ... capture failed
 3. 回复结束后 `enterIdle()` 里 `resumeKeepAliveAfterSpeech()` 重新起 keep-alive，并
    `resetSpeechSynthesizer()` **替换** synthesizer，释放它占用的音频单元/路由。
 4. 录音引擎仍是 input-only；音频路由被释放后，下一轮的 16 kHz 输入应能拿到真实音频。
+
+**补充：用 CoreAudio 强制蓝牙输出进入 16 kHz（HFP）**
+
+多轮之后耳机可能不再自动进入 HFP：16 kHz 输入回调存在但全是 0，重试退到 44.1 kHz 后停摆。
+`AudioRoute.preferHFPForInput()` 在停止 keep-alive 后、录音引擎启动前，把**默认蓝牙输出设备**
+的 nominal sample rate 设为 16000（`kAudioDevicePropertyNominalSampleRate`），促使设备重新协商
+HFP；停止录音后 `restoreOutputRate()` 恢复原采样率（通常 44.1 kHz）再重建 A2DP keep-alive。
+日志会打印 `[AudioRoute] forcing HFP ...` / `restoring ...`。
+
+注意：这是在系统层面短暂改变蓝牙输出采样率，会影响该设备上的其他音频；如果设备不支持或
+恢复失败，需要改用独立麦克风 / 扬声器输出方案。

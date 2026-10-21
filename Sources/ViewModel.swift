@@ -112,6 +112,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private var currentTurnUserMessageID: UUID?
 
     private let mediaKeys = MediaKeyController()
+    private let audioRoute = AudioRoute()
 
     override init() {
         appConfig = AppConfig.load()
@@ -367,6 +368,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         // make AVAudioEngine.start() hang or deliver zero input callbacks
         // (the device is mid A2DP<->HFP switch). ~0.6s is enough in practice.
         mediaKeys.pauseKeepAliveForRecording()
+        audioRoute.preferHFPForInput()
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 600_000_000)
             guard let self, self.isCurrent(gen), self.conversationState == .listening else {
@@ -398,8 +400,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         Task { await opencodeClient?.interrupt() }
 
         stopSynthesis()
-        mediaKeys.resumeKeepAliveAfterSpeech()
-        resetSpeechSynthesizer()
         isTyping = false
 
         recorder?.onSpeechEnded = nil
@@ -427,8 +427,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         ttsWaitAttempts = 0
 
         stopSynthesis()
-        mediaKeys.resumeKeepAliveAfterSpeech()
-        resetSpeechSynthesizer()
         isTyping = false
         gracefulExitPending = false
         llamaCppClient?.cancel()
@@ -501,6 +499,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @discardableResult
     private func stopRecordingAndResumeKeepAlive() -> [Float] {
         let samples = recorder?.stopRecording() ?? []
+        audioRoute.restoreOutputRate()
         mediaKeys.resumeKeepAliveAfterRecording()
         return samples
     }
@@ -531,8 +530,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         isTyping = false
         currentTurnUserMessageID = nil
         debugInfo = text
-        mediaKeys.resumeKeepAliveAfterSpeech()
-        resetSpeechSynthesizer()
         mediaKeys.setPlaying()
         if noAutoResume {
             restartTask?.cancel()
@@ -1134,9 +1131,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             conversationState = .speaking
             logStateChange(.speaking)
             debugInfo = "Speaking..."
-            // TTS owns the output route now: stop the silent keep-alive so it
-            // cannot clip the first words or hold A2DP.
-            mediaKeys.suspendKeepAliveForSpeech()
         }
 
         ttsQueue.append(trimmed)
