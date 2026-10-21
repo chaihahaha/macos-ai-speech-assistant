@@ -25,7 +25,7 @@
 | 8 | Now Playing keep-alive 强制 rate=1.0；无效命令仍 isEnabled | 暂停状态被系统误判，媒体键可能被路由走 | `MediaKeyController` |
 | 9 | 录音引擎与伪装播放引擎是同一个 `AVAudioEngine`，停止录音时不 `engine.stop()` | 麦克风常开 → 蓝牙停留在 HFP；keep-alive 引擎在 A2DP/HFP 切换时挂掉 → 丢 Now Playing → 媒体键失效；TTS 走 HFP 可能完全听不到 | `AudioRecorder` / `ViewModel.loadModels` |
 | 10 | 停止会话时把 `playbackState` 设为 `.paused` | macOS 可能不再把媒体键投给本 App | `ViewModel.stopConversation` |
-| 11 | 右耳三击 = `nextTrack` 被映射为 TTS 语速 | 三击看起来"没反应" | `ViewModel.setupMediaKeys` |
+| 11 | `toggleTTSSpeed` 停掉当前朗读后只重播 `pendingSentence`（错误的 buffer），且清空计数后不再回到监听 | 三击可能卡在 `.speaking`，看起来"没反应" | `ViewModel.toggleTTSSpeed` |
 
 ### 真机诊断：EDIFIER X Fit（蓝牙）按键实测
 
@@ -49,8 +49,12 @@
   `play/pause` 来自**双击**（左右耳双击都发 `play/pause`，无法区分左右）。
   上一轮 24 个手势共 12 条事件的正确分解是：8 个双击 → 8 条 play/pause，
   4 个右耳三击 → 4 条 nextTrack，8 个单击 + 4 个左耳三击 → 0 条。
-* 因此：**这只耳机的可用手势是"双击"（主操作）和"右耳三击"（nextTrack）**。
+* 因此：**这只耳机的可用手势是"双击"（主操作/会话开关）和"右耳三击"（`nextTrack`，绑定 TTS 语速切换）**。
   单击永远不会有反应，不是 App 的 bug。
+* 右耳三击已按要求绑定为 **TTS 语速切换**（`nextTrack → toggleTTSSpeed`）。为避免切速时把整段朗读
+  弄丢/卡死，TTS 改为显式句子队列：`ttsQueue` + `currentlySpeakingText`，一次只喂一句给
+  `AVSpeechSynthesizer`；切速时把当前句放回队首、用新语速重播，队列其余句子保留。
+  未在朗读时用独立 `speedAnnouncer` 播"快/慢"作为反馈，界面底部也会显示当前倍速。
 * App 必须始终是 Now Playing App，这是该耳机按键唯一的投递路径；丢掉 Now Playing 就等于
   按键全灭。旧代码里"录音引擎 = 伪装播放引擎"导致麦克风常开、蓝牙在 A2DP/HFP 间切换、
   keep-alive 引擎挂掉 —— 这是"有时候双击也没反应"的真正原因。
@@ -73,6 +77,9 @@
   否则在 1.0~1.5s 的间隙按媒体键会被当成"打断进行中的回答"，把刚拿到的整轮对话删掉。
 * **只删本轮**：`currentTurnUserMessageID` 记录本轮 user 消息，打断时只删这一轮；
   在 `.transcribing` 阶段（user 消息还没落库）打断不会误删上一轮。
+* **TTS 句子队列**：`ttsQueue` + `currentlySpeakingText`，一次只喂一句给
+  `AVSpeechSynthesizer`。`toggleTTSSpeed()` 只把当前句放回队首并用新语速重播，保留其余队列；
+  不再像旧实现那样 stop 后重播 `pendingSentence`（会丢句子、卡在 `.speaking`）。
 
 ### 改动文件
 

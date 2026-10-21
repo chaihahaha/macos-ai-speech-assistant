@@ -43,6 +43,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @Published var debugInfo: String = ""
     @Published var isTyping = false
     @Published var silenceTimerValue: Double = 5.0
+    @Published var ttsRateLabel: String = ""
     @Published var currentSessID: String? = nil
 
     @Published var selectedBackend: String = "opencode"
@@ -64,9 +65,16 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private var ttsRate: Float
 
     private let speechSynthesizer = AVSpeechSynthesizer()
+    /// Separate synthesizer used only for the short "快 / 慢" speed confirmation,
+    /// so it never disturbs the conversation TTS bookkeeping.
+    private let speedAnnouncer = AVSpeechSynthesizer()
     private var pendingSentence: String = ""
     private var hasStartedSpeaking = false
-    private var pendingUtteranceCount = 0
+    /// Sentences waiting to be spoken. They are handed to
+    /// `AVSpeechSynthesizer` one at a time so a speed change can restart the
+    /// current sentence without losing the rest of the reply.
+    private var ttsQueue: [String] = []
+    private var currentlySpeakingText: String?
     private var streamingComplete = false
     /// Maps each utterance to the generation that queued it, so completions
     /// coming from a stopped/interrupted cycle can be ignored.
@@ -105,6 +113,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     override init() {
         appConfig = AppConfig.load()
         ttsRate = appConfig.tts.rate
+        ttsRateLabel = String(format: "%.2fx", ttsRate)
 
         selectedBackend = appConfig.backend
         llamacppURL = appConfig.llamacpp.serverURL
@@ -133,9 +142,8 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             // all), so this is the primary talk control.
             playPause: { [weak self] in self?.handlePlayPause() },
             // EDIFIER X Fit: right-ear triple press reports as `nextTrack`.
-            // Treat it as the same primary action instead of silently toggling
-            // TTS speed (which looked like "the key does nothing").
-            nextTrack: { [weak self] in self?.handlePlayPause() },
+            // Bound to the TTS speed toggle as requested.
+            nextTrack: { [weak self] in self?.toggleTTSSpeed() },
             // Not emitted by this headset; kept for other AVRCP devices.
             previousTrack: { [weak self] in self?.toggleTTSSpeed() }
         )
@@ -198,7 +206,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     private func toggleTTSSpeed() {
-        print("[MediaKey] toggleTTSSpeed, rate=\(ttsRate) state=\(conversationState.rawValue)")
+        print("[MediaKey] toggleTTSSpeed, before=\(ttsRate) state=\(conversationState.rawValue)")
         if ttsRate <= appConfig.tts.slowRate + 0.05 {
             ttsRate = 1.5
             debugInfo = "TTS: fast (1.5x)"
@@ -206,21 +214,34 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             ttsRate = appConfig.tts.slowRate
             debugInfo = "TTS: slow (\(String(format: "%.1f", ttsRate))x)"
         }
+        ttsRateLabel = String(format: "%.2fx", ttsRate)
         print("[MediaKey] TTS rate: \(ttsRate)")
 
-        if speechSynthesizer.isSpeaking || hasStartedSpeaking {
-            let current = pendingSentence
-            // Drop bookkeeping for the utterances we are about to stop so their
-            // (asynchronous) cancellation callbacks are ignored.
-            speechSynthesizer.stopSpeaking(at: .immediate)
-            pendingUtteranceCount = 0
+        if let current = currentlySpeakingText {
+            // Restart the sentence that is playing so the change is audible
+            // immediately. The rest of the queue is preserved and will also be
+            // spoken at the new rate.
             utteranceGenerations.removeAll()
-            hasStartedSpeaking = false
-            pendingSentence = ""
-            if !current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                speakSentence(current)
-            }
+            currentlySpeakingText = nil
+            speechSynthesizer.stopSpeaking(at: .immediate)
+            ttsQueue.insert(current, at: 0)
+            drainTTSQueue()
+        } else {
+            // Nothing to restart — announce so a triple-click while idle is
+            // not silent.
+            announceTTSSpeed()
         }
+    }
+
+    private func announceTTSSpeed() {
+        let text = ttsRate >= 1.0 ? "快" : "慢"
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
+            ?? AVSpeechSynthesisVoice(language: "en-US")
+        utterance.rate = AVSpeechUtteranceDefaultSpeechRate * ttsRate
+        utterance.volume = 1.0
+        speedAnnouncer.stopSpeaking(at: .immediate)
+        speedAnnouncer.speak(utterance)
     }
 
     // MARK: - State transitions
@@ -268,8 +289,10 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         beepCount = 0
         hasStartedSpeaking = false
         streamingComplete = false
-        pendingUtteranceCount = 0
+        ttsQueue.removeAll()
+        currentlySpeakingText = nil
         utteranceGenerations.removeAll()
+        speedAnnouncer.stopSpeaking(at: .immediate)
         pendingAudio = []
         currentTurnUserMessageID = nil
 
@@ -383,12 +406,16 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     private func stopSynthesis() {
+        // Invalidate bookkeeping *before* stopping so the asynchronous
+        // didCancel callbacks are ignored.
+        utteranceGenerations.removeAll()
+        currentlySpeakingText = nil
+        ttsQueue.removeAll()
         speechSynthesizer.stopSpeaking(at: .immediate)
+        speedAnnouncer.stopSpeaking(at: .immediate)
         hasStartedSpeaking = false
         pendingSentence = ""
         streamingComplete = false
-        pendingUtteranceCount = 0
-        utteranceGenerations.removeAll()
     }
 
     /// Schedules `startListening()` after `delay`, in a task that is cancelled by
@@ -498,8 +525,14 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         guard let gen = utteranceGenerations.removeValue(forKey: key) else { return }
         guard isCurrent(gen) else { return }
 
-        pendingUtteranceCount = max(0, pendingUtteranceCount - 1)
-        guard streamingComplete, pendingUtteranceCount == 0 else { return }
+        // This was the sentence we fed to the synthesizer; move on to the next
+        // queued sentence, if any.
+        currentlySpeakingText = nil
+        if !ttsQueue.isEmpty {
+            drainTTSQueue()
+            return
+        }
+        guard streamingComplete else { return }
         print("[TTS] All utterances finished, waiting before resuming listening")
         streamingComplete = false
         enterAutoRestart(after: 1.5, reason: "ttsFinished")
@@ -762,7 +795,8 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         hasStartedSpeaking = false
         pendingSentence = ""
         streamingComplete = false
-        pendingUtteranceCount = 0
+        ttsQueue.removeAll()
+        currentlySpeakingText = nil
         utteranceGenerations.removeAll()
     }
 
@@ -771,7 +805,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private func finishStreaming(generation gen: UInt64) {
         guard isCurrent(gen) else { return }
         streamingComplete = true
-        if pendingUtteranceCount == 0 {
+        if currentlySpeakingText == nil && ttsQueue.isEmpty {
             streamingComplete = false
             enterAutoRestart(after: 1.0, reason: "generationFinished")
         }
@@ -921,12 +955,22 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             debugInfo = "Speaking..."
         }
 
-        pendingUtteranceCount += 1
+        ttsQueue.append(trimmed)
+        drainTTSQueue()
+    }
 
-        let language = detectLanguage(from: trimmed)
+    /// Feeds exactly one sentence to `AVSpeechSynthesizer` at a time. Keeping
+    /// the queue ourselves lets `toggleTTSSpeed()` restart the current sentence
+    /// at the new rate without losing the remaining sentences.
+    private func drainTTSQueue() {
+        guard currentlySpeakingText == nil, !ttsQueue.isEmpty else { return }
+        let text = ttsQueue.removeFirst()
+        currentlySpeakingText = text
+
+        let language = detectLanguage(from: text)
         let voiceLanguage = language == "chinese" ? "zh-CN" : "en-US"
 
-        let utterance = AVSpeechUtterance(string: trimmed)
+        let utterance = AVSpeechUtterance(string: text)
         if let voice = AVSpeechSynthesisVoice(language: voiceLanguage) {
             utterance.voice = voice
         }

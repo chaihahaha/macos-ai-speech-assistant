@@ -62,7 +62,7 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
                 Spacer()
-                Text("TTS: macOS System TTS")
+                Text("TTS: 系统语音 \(viewModel.ttsRateLabel)")
                     .font(.caption)
                     .foregroundColor(.secondary)
                 Spacer()
