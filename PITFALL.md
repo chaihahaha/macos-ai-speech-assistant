@@ -587,3 +587,15 @@ macOS 上不可靠（第二轮起 16k 静音、44.1k 停摆）。
 * 代价：会话期间 TTS 是 HFP 通话音质（16 kHz），麦克风一直开着（未收集时丢弃样本）。
 
 三击在 HFP 下仍然收不到（固件不发 AVRCP，见 #17）；录音中退出只能用界面按钮。
+
+**不要再把"用户沉默"当成麦克风故障**
+
+持久 HFP 下用户可能长时间不说话，tap 回调仍在、数据全 0。旧的 `silent input` watchdog
+把 `periodPeak==0` 当成输入端点失效，2 秒后 teardown + 重试；重试时设备退到 44.1k/0 回调，
+最终 `capture failed` → 两次提示音 + "Bluetooth headset not connected"。已删除该静音重试：
+只有 **0 个回调**（引擎真的死了）才重试；回调在跑、数据为 0 视为正常沉默。
+
+录音超时现在：
+* 默认 60s（`recordingTimeout`，设置面板可改）；
+* 超时后如果整段音频 peak < 0.003（一直没说话），直接 `stopConversation` 回 idle，
+  不再跑 ASR/LLM；有声音才进管线。

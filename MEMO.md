@@ -120,6 +120,10 @@
 * **录音时的三击不可行**：实测即使把静音 keep-alive 放内置扬声器、App 保持 Now Playing，
   录音（HFP）期间也收不到任何 AVRCP 事件 → 耳机固件在 HFP 下不发媒体键。该方案已回退
   （还会让 TTS 路由变噪音）。录音中退出只能用界面按钮。
+* **沉默≠麦克风故障**：已删除 `periodPeak==0` 的静音重试；只有 0 回调才重试。录音超时
+  （可配置，设置面板）时若无语音（peak<0.003）直接回 idle；有语音才进 ASR。
+* **设置面板**：TTS 语速 slider（tts.fastRate）和录音超时（vad.maxRecordingDuration）
+  可在齿轮设置里改，Apply 持久化。
 * **失败提示音**：capture 失败播 Basso、软重试进入 listening 播 Glass，避免用户干等。
 * **驱动不可行**：macOS kext 已废弃/需关 SIP，DriverKit 不提供通用蓝牙音频/HFP 驱动；
   蓝牙音频由闭源 bluetoothd + coreaudiod 管理。HAL 虚拟声卡仍走同一蓝牙栈，无法绕过

@@ -44,6 +44,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @Published var isTyping = false
     @Published var silenceTimerValue: Double = 5.0
     @Published var ttsRateLabel: String = ""
+    @Published var recordingTimeout: Double = 60
     @Published var currentSessID: String? = nil
 
     @Published var selectedBackend: String = "opencode"
@@ -62,7 +63,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private var opencodeServerProcess: Process?
 
     private let appConfig: AppConfig
-    private var ttsRate: Float
+    @Published var ttsRate: Float
 
     private var speechSynthesizer = AVSpeechSynthesizer()
     private var pendingSentence: String = ""
@@ -120,8 +121,10 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         appConfig = AppConfig.load()
         // Triple press is now the "exit" gesture, so the TTS rate is fixed at
         // the fast setting (config.json -> tts.fastRate).
-        ttsRate = appConfig.tts.fastRate > 0 ? appConfig.tts.fastRate : 1.3
-        ttsRateLabel = String(format: "%.2fx", ttsRate)
+        let configuredRate = appConfig.tts.fastRate > 0 ? appConfig.tts.fastRate : 1.3
+        ttsRate = configuredRate
+        recordingTimeout = appConfig.vad.maxRecordingDuration > 0 ? appConfig.vad.maxRecordingDuration : 60
+        ttsRateLabel = String(format: "%.2fx", configuredRate)
 
         selectedBackend = appConfig.backend
         llamacppURL = appConfig.llamacpp.serverURL
@@ -356,12 +359,22 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         currentTurnUserMessageID = nil
 
         maxRecordingTimer?.invalidate()
-        maxRecordingTimer = Timer.scheduledTimer(withTimeInterval: appConfig.vad.maxRecordingDuration, repeats: false) { [weak self] _ in
+        maxRecordingTimer = Timer.scheduledTimer(withTimeInterval: recordingTimeout, repeats: false) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.isCurrent(gen) else { return }
                 guard self.conversationState == .listening || self.conversationState == .waitingSilence else { return }
                 print("[VM] maxRecordingDuration reached")
-                self.pendingAudio = self.finishCaptureKeepingHFP()
+                let audio = self.finishCaptureKeepingHFP()
+                var peak: Float = 0
+                for sample in audio { peak = max(peak, abs(sample)) }
+                if peak < 0.003 {
+                    // Long silence: go straight back to idle instead of sending
+                    // an empty clip through ASR/LLM.
+                    self.logConversation("[\(self.timestamp())] TIMEOUT: no speech, returning to idle")
+                    self.stopConversation(caller: "recordingTimeoutSilence")
+                    return
+                }
+                self.pendingAudio = audio
                 self.cancelPendingWork(cancelPipeline: false)
                 self.launchPipeline(generation: gen)
             }
@@ -781,6 +794,9 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         updated.opencode.modelID = opencodeModelID
         updated.opencode.agent = opencodeAgent
         updated.opencode.directory = opencodeDirectory
+        updated.tts.fastRate = ttsRate
+        updated.vad.maxRecordingDuration = max(5, recordingTimeout)
+        ttsRateLabel = String(format: "%.2fx", ttsRate)
         let saved = updated.save()
 
         errorMessage = nil

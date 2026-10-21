@@ -175,6 +175,26 @@ struct ContentView: View {
                 opencodeSettings
             }
 
+            Divider()
+
+            HStack(spacing: 6) {
+                Text("TTS speed:").font(.caption).foregroundColor(.secondary)
+                Slider(value: $viewModel.ttsRate, in: 0.5...2.0, step: 0.05)
+                Text(String(format: "%.2fx", viewModel.ttsRate))
+                    .font(.caption)
+                    .monospacedDigit()
+                    .frame(width: 44, alignment: .trailing)
+            }
+
+            HStack(spacing: 6) {
+                Text("Recording timeout:").font(.caption).foregroundColor(.secondary)
+                TextField("60", value: $viewModel.recordingTimeout, format: .number)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .frame(width: 60)
+                Text("seconds (no speech → idle)").font(.caption).foregroundColor(.secondary)
+            }
+
             HStack {
                 Spacer()
                 Button("Apply") { viewModel.applyBackendSettings() }

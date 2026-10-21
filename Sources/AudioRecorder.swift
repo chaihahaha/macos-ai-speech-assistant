@@ -328,15 +328,11 @@ final class AudioRecorder {
             } else {
                 consecutiveZeroPeakChecks += 1
             }
-            // Callbacks are flowing but the microphone is delivering pure
-            // silence: likely bound to an inactive HFP endpoint. Recreate the
-            // engine so it renegotiates the Bluetooth profile.
-            if observedPeak == 0, consecutiveZeroPeakChecks >= 4 { // ~2 s
-                consecutiveZeroPeakChecks = 0
-                report("[AudioRecorder] input is silent (peak=0) for ~2s; restarting capture")
-                lastTapChange = Date()
-                scheduleRetry(token: token, attempt: currentAttempt, reason: "silent input")
-            }
+            // NOTE: do NOT treat silence as a dead microphone. With the
+            // persistent HFP session the user may simply be quiet for a while;
+            // tearing the engine down here caused the retry/beep/"headset not
+            // connected" cascade. Only zero callbacks (checked below) mean the
+            // engine is dead.
             return
         }
 
