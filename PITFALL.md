@@ -311,3 +311,38 @@ otool -s __TEXT __info_plist .build/debug/MyLlamaSpeechAssistant   # 必须能�
 3. 再次校验 `generation` 与 `state == .listening` 后才 `recorder.startRecording()`
 
 用户在这 0.6s 内双击会走 `stopConversation`，generation 改变，延迟任务自动作废。
+
+---
+
+## 12. 第二轮录音绑定了错误的输入端点（44.1 kHz 而非耳机 16 kHz HFP）
+
+**现象**
+
+第一轮正常（`input format 1 ch, 16000 Hz`，有 `TAP`、`peak`）；第二轮：
+
+```
+[AudioRecorder] input format=<1 ch, 44100 Hz>
+[AudioRecorder] engine started
+[AudioRecorder] capture started
+（没有 TAP: first callback，直到 maxRecordingDuration 60s 超时，0 samples）
+```
+
+**原因**
+
+第一轮结束后 keep-alive/TTS 把蓝牙切回 A2DP；第二次录音时设备正在切回 HFP，
+`AVAudioEngine` 可能先拿到一个陈旧的/错误的输入端点（44.1k），把 tap 装成 44.1k；
+随后设备切到 16k，tap 与节点格式不再匹配，永远不触发。
+
+**修复**
+
+`AudioRecorder` 现在：
+
+1. **每次 capture 尝试都新建 `AVAudioEngine()`**（不重用旧 engine 的格式/端点）。
+2. **tap watchdog**：启动后 0.9s 内 `tapFireCount == 0` → teardown、等待 0.5s、用新 engine 重试，
+   最多 3 次。
+3. 每次尝试都记录 `defaultInput=<设备名 id 采样率>`，可直接看出是不是选错了设备。
+4. 3 次都失败 → `onCaptureFailed` → 界面红色报错并停止，不再干等 60s。
+5. `captureToken` 防止旧的 tap / 延迟重试在停止后继续写数据。
+
+**排查口诀**：日志里 `input format` 的采样率不是 16000、或 `defaultInput` 不是耳机 →
+输入端点选错了；看 `attempt 1/3 ... attempt 2/3 ...` 是否重试成功。

@@ -654,6 +654,13 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             recorder.onLog = { [weak self] message in
                 self?.logConversation(message)
             }
+            recorder.onCaptureFailed = { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.errorMessage = "Microphone capture failed after retries. Check the input device / Bluetooth connection."
+                    self.stopConversation(caller: "captureFailed")
+                }
+            }
             self.recorder = recorder
 
             loadingStatus = "Ready"

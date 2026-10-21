@@ -1,32 +1,31 @@
 import AVFoundation
 import Foundation
+import CoreAudio
 import SpeechVAD
 
 /// Captures microphone audio through an `AVAudioEngine` tap, converts it to
 /// 16 kHz mono float samples and feeds it to the streaming VAD.
 ///
-/// The recorder owns a **dedicated** engine. It must not share the engine that
-/// keeps the app registered as "Now Playing": as soon as an input tap is
-/// installed on an engine, macOS opens the microphone and Bluetooth headsets
-/// switch from A2DP to HFP (hands-free / call mode). If that engine keeps
-/// running after recording, the microphone stays open — output then goes
-/// through the headset's call path (often silent) and the headset's button
-/// changes from media keys to call controls.
-///
-/// The lifecycle is also idempotent: `startRecording()` on an already running
-/// recorder is a no-op (installing a second tap on the same bus raises an
-/// Objective-C exception), and `stopRecording()` on a stopped recorder returns
-/// no samples instead of removing a tap that was never installed.
+/// Hard-won lessons (see PITFALL.md #11/#12):
+/// * only **one** `AVAudioEngine` may run in the process (a silent Now-Playing
+///   output engine started first starves the input tap entirely);
+/// * after the Bluetooth profile switches A2DP ↔ HFP, the first capture attempt
+///   can bind to the wrong input endpoint (e.g. 44.1 kHz instead of the
+///   headset's 16 kHz HFP) and then the tap never fires. We therefore watch for
+///   a silent tap and retry with a **fresh engine** after a short settle delay;
+/// * graph mutations (attach/connect) must happen before `engine.start()`.
 final class AudioRecorder {
     private(set) var isRecording = false
     private(set) var audioLevel: Float = 0
 
     var onSpeechEnded: (() -> Void)?
+    /// Called when every capture attempt failed (no input callbacks at all).
+    var onCaptureFailed: (() -> Void)?
     /// Diagnostics sink (the ViewModel writes these into the conversation log).
     var onLog: ((String) -> Void)?
 
-    /// Dedicated engine — only ever used for microphone capture.
-    private let engine = AVAudioEngine()
+    /// Recreated for every capture attempt.
+    private var engine = AVAudioEngine()
     private var samples: [Float] = []
     /// Peak absolute sample seen since `startRecording()` (guarded by `sampleLock`).
     private var peak: Float = 0
@@ -34,18 +33,27 @@ final class AudioRecorder {
     private let sampleLock = NSLock()
     /// Protects `vadProcessor` (touched from the audio thread and from main).
     private let vadLock = NSLock()
-    /// Protects `isRecording` / `tapFireCount`.
+    /// Protects `isRecording` / `tapFireCount` / `captureToken`.
     private let stateLock = NSLock()
     private let targetSampleRate: Double
 
     private let vadProcessor: StreamingVADProcessor
     private var speechActive = false
     private var tapFireCount: Int = 0
+    private var tapInstalled = false
+    /// Incremented on every start/stop so stale retries and stale taps are ignored.
+    private var captureToken = 0
+
+    private static let maxCaptureAttempts = 3
+    /// How long to wait for the first tap callback before declaring the attempt dead.
+    private static let tapWatchdogDelay: TimeInterval = 0.9
+    /// Settle time between a failed attempt and the next one.
+    private static let retryDelay: TimeInterval = 0.5
 
     /// Silent looping player attached to the SAME engine as the input tap.
     /// While recording this is the only AVAudioEngine in the process, so the
     /// app stays "Now Playing" (media keys keep working) without a second
-    /// output engine that would starve the input tap (see PITFALL.md #11).
+    /// output engine that would starve the input tap.
     private var keepAlivePlayer: AVAudioPlayerNode?
 
     init(targetSampleRate: Double = 16000, vadProcessor: StreamingVADProcessor) {
@@ -60,6 +68,8 @@ final class AudioRecorder {
         }
     }
 
+    // MARK: - Public API
+
     func startRecording() {
         stateLock.lock()
         if isRecording {
@@ -69,6 +79,8 @@ final class AudioRecorder {
         }
         isRecording = true
         tapFireCount = 0
+        captureToken &+= 1
+        let token = captureToken
         stateLock.unlock()
 
         report("[AudioRecorder] startRecording called, engine.running=\(engine.isRunning)")
@@ -84,15 +96,50 @@ final class AudioRecorder {
         vadLock.unlock()
         report("[AudioRecorder] VAD reset")
 
+        beginCapture(token: token, attempt: 1)
+    }
+
+    @discardableResult
+    func stopRecording() -> [Float] {
+        stateLock.lock()
+        guard isRecording else {
+            stateLock.unlock()
+            return []
+        }
+        isRecording = false
+        captureToken &+= 1 // invalidate any pending retry / watchdog
+        let fireCount = tapFireCount
+        stateLock.unlock()
+
+        teardownEngine()
+
+        sampleLock.lock()
+        let result = samples
+        let count = result.count
+        let peakValue = peak
+        samples.removeAll()
+        peak = 0
+        sampleLock.unlock()
+        report("[AudioRecorder] stopped: \(count) samples (\(String(format: "%.2f", Double(count) / targetSampleRate))s), peak=\(String(format: "%.4f", peakValue)), tapFireCount=\(fireCount)")
+        return result
+    }
+
+    // MARK: - Capture lifecycle
+
+    private func beginCapture(token: Int, attempt: Int) {
+        guard isCurrentCapture(token) else { return }
+
+        // Fresh engine for every attempt: a reused engine can keep the previous
+        // (wrong) input format/endpoint after a Bluetooth profile switch.
+        engine = AVAudioEngine()
+        tapInstalled = false
         let inputNode = engine.inputNode
         let inputFormat = inputNode.inputFormat(forBus: 0)
-        report("[AudioRecorder] input format=\(inputFormat), sampleRate=\(inputFormat.sampleRate), channels=\(inputFormat.channelCount)")
+        report("[AudioRecorder] attempt \(attempt)/\(Self.maxCaptureAttempts) input=\(inputFormat) defaultInput=\(defaultInputInfo())")
 
         guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
-            report("[AudioRecorder] no usable microphone format; aborting recording")
-            stateLock.lock()
-            isRecording = false
-            stateLock.unlock()
+            report("[AudioRecorder] no usable microphone format")
+            scheduleRetry(token: token, attempt: attempt, reason: "invalid input format")
             return
         }
 
@@ -102,44 +149,90 @@ final class AudioRecorder {
                                                   interleaved: false),
               let converter = AVAudioConverter(from: inputFormat, to: recordingFormat) else {
             report("[AudioRecorder] failed to create converter \(inputFormat) -> \(targetSampleRate)Hz mono")
-            stateLock.lock()
-            isRecording = false
-            stateLock.unlock()
+            scheduleRetry(token: token, attempt: attempt, reason: "converter creation failed")
             return
         }
 
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
             guard let self else { return }
             self.stateLock.lock()
-            let active = self.isRecording
+            let active = self.isRecording && token == self.captureToken
             self.stateLock.unlock()
             guard active else { return }
             self.handleTap(buffer: buffer, converter: converter, recordingFormat: recordingFormat)
         }
+        tapInstalled = true
 
-        // Attach the silent player BEFORE starting: mutating the graph while the
-        // engine runs can hang/crash, and connecting before start is what the
-        // successful probe used.
         prepareKeepAlivePlayer()
 
-        if !engine.isRunning {
-            do {
-                try engine.start()
-                report("[AudioRecorder] engine started")
-            } catch {
-                report("[AudioRecorder] engine start failed: \(error)")
-                inputNode.removeTap(onBus: 0)
-                keepAlivePlayer = nil
-                stateLock.lock()
-                isRecording = false
-                stateLock.unlock()
-                return
-            }
+        do {
+            try engine.start()
+            report("[AudioRecorder] engine started")
+        } catch {
+            report("[AudioRecorder] engine start failed: \(error)")
+            scheduleRetry(token: token, attempt: attempt, reason: "engine start failed")
+            return
         }
 
         keepAlivePlayer?.play()
         report("[AudioRecorder] capture started (AVAudioEngine tap)")
+
+        // If the tap never fires, we bound to a dead endpoint. Recreate the
+        // engine and try again after the device settles.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.tapWatchdogDelay) { [weak self] in
+            guard let self else { return }
+            self.stateLock.lock()
+            let active = self.isRecording && token == self.captureToken
+            let fires = self.tapFireCount
+            self.stateLock.unlock()
+            guard active, fires == 0 else { return }
+            self.report("[AudioRecorder] no input callbacks after \(Self.tapWatchdogDelay)s")
+            self.scheduleRetry(token: token, attempt: attempt, reason: "tap watchdog")
+        }
     }
+
+    private func scheduleRetry(token: Int, attempt: Int, reason: String) {
+        guard isCurrentCapture(token) else { return }
+        teardownEngine()
+
+        guard attempt < Self.maxCaptureAttempts else {
+            report("[AudioRecorder] capture failed after \(attempt) attempts (\(reason))")
+            stateLock.lock()
+            isRecording = false
+            captureToken &+= 1
+            stateLock.unlock()
+            DispatchQueue.main.async { [weak self] in
+                self?.onCaptureFailed?()
+            }
+            return
+        }
+
+        report("[AudioRecorder] retrying capture in \(Self.retryDelay)s (attempt \(attempt) failed: \(reason))")
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.retryDelay) { [weak self] in
+            guard let self, self.isCurrentCapture(token) else { return }
+            self.beginCapture(token: token, attempt: attempt + 1)
+        }
+    }
+
+    private func teardownEngine() {
+        keepAlivePlayer?.stop()
+        keepAlivePlayer = nil
+        if tapInstalled {
+            engine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        engine.stop()
+        engine.reset()
+    }
+
+    private func isCurrentCapture(_ token: Int) -> Bool {
+        stateLock.lock()
+        let ok = isRecording && token == captureToken
+        stateLock.unlock()
+        return ok
+    }
+
+    // MARK: - Audio
 
     /// Runs on the audio render thread.
     private func handleTap(buffer: AVAudioPCMBuffer, converter: AVAudioConverter, recordingFormat: AVAudioFormat) {
@@ -206,54 +299,21 @@ final class AudioRecorder {
         }
     }
 
-    @discardableResult
-    func stopRecording() -> [Float] {
-        stateLock.lock()
-        guard isRecording else {
-            stateLock.unlock()
-            return []
-        }
-        isRecording = false
-        let fireCount = tapFireCount
-        stateLock.unlock()
-
-        // Remove the tap and stop the engine completely: this is what releases
-        // the microphone and lets a Bluetooth headset return to A2DP.
-        keepAlivePlayer?.stop()
-        keepAlivePlayer = nil
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        engine.reset()
-        audioLevel = 0
-
-        sampleLock.lock()
-        let result = samples
-        let count = result.count
-        let peakValue = peak
-        samples.removeAll()
-        peak = 0
-        sampleLock.unlock()
-        report("[AudioRecorder] stopped: \(count) samples (\(String(format: "%.2f", Double(count) / targetSampleRate))s), peak=\(String(format: "%.4f", peakValue)), tapFireCount=\(fireCount)")
-        return result
-    }
-
     deinit {
         stateLock.lock()
-        let active = isRecording
         isRecording = false
+        captureToken &+= 1
         stateLock.unlock()
-        if active {
-            keepAlivePlayer?.stop()
-            keepAlivePlayer = nil
+        if tapInstalled {
             engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
+            tapInstalled = false
         }
+        engine.stop()
     }
 
     /// Attach a zero-volume looping player to the recording engine so macOS
     /// keeps treating this process as the Now Playing app while the mic is open.
-    /// Must be called BEFORE `engine.start()` (graph mutation after start can
-    /// hang), and the player is started after the engine is running.
+    /// Must be called BEFORE `engine.start()`.
     private func prepareKeepAlivePlayer() {
         let format = engine.outputNode.inputFormat(forBus: 0)
         guard format.channelCount > 0, format.sampleRate > 0 else {
@@ -277,5 +337,41 @@ final class AudioRecorder {
         player.volume = 0
         keepAlivePlayer = player
         report("[AudioRecorder] keep-alive player prepared, output format=\(format)")
+    }
+
+    /// Diagnostics: which device does AVAudioEngine actually use as input?
+    private func defaultInputInfo() -> String {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var device = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device)
+        guard status == noErr, device != 0 else { return "none" }
+
+        var nameAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var name: Unmanaged<CFString>?
+        var nameSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let nameStatus = withUnsafeMutablePointer(to: &name) { pointer in
+            AudioObjectGetPropertyData(device, &nameAddress, 0, nil, &nameSize, pointer)
+        }
+        let deviceName = (nameStatus == noErr ? name?.takeUnretainedValue() as String? : nil) ?? "?"
+
+        var rateAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var rate: Float64 = 0
+        var rateSize = UInt32(MemoryLayout<Float64>.size)
+        let rateStatus = AudioObjectGetPropertyData(device, &rateAddress, 0, nil, &rateSize, &rate)
+        let rateText = rateStatus == noErr ? String(format: "%.0f", rate) : "?"
+        return "\(deviceName) id=\(device) sr=\(rateText)"
     }
 }

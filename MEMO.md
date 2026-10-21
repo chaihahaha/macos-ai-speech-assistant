@@ -90,6 +90,10 @@
   Now Playing keep-alive；录音 engine 自带静音 player（attach/connect 必须在 start 之前）
   维持 Now Playing；停止录音后 stop+reset 录音 engine，再重建 keep-alive。
   两个 engine 同时开会令输入 tap 静默失败（见 PITFALL.md 第 11 节）。
+* **capture 重试**：每次尝试用新的 `AVAudioEngine`；0.9s 没有 tap 回调就 teardown、
+  等 0.5s 重试（最多 3 次），并记录 `defaultInput`（设备/采样率）。全部失败走
+  `onCaptureFailed` 显示错误。原因是蓝牙在 A2DP↔HFP 切换时可能绑定到 44.1k 的错误输入端点。
+  见 PITFALL.md 第 12 节。
 * **settle 延迟**：停掉 keep-alive 后立刻 start 录音引擎会挂起或 0 回调；`startListening`
   现在 `pauseKeepAliveForRecording()` → `Task.sleep(0.6s)` → 校验 generation/state → `startRecording()`。
 * **配置持久化**：`applyBackendSettings()` 调用 `AppConfig.save()` 写回
