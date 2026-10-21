@@ -491,15 +491,19 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     /// the user starts the next recording manually (double press). This also
     /// makes "triple press while idle = undo last turn" reachable after a normal
     /// answer.
+    /// A turn finished **normally**: go idle briefly and automatically resume
+    /// listening for the next turn. Interrupts/undo deliberately do NOT use this
+    /// path — they stay idle until the user starts the next recording manually.
     private func finishTurn() {
         guard conversationState != .inactive else { return }
-        print("[VM] cycle complete, going idle (state was \(conversationState.rawValue))")
+        print("[VM] cycle complete, resuming listening (state was \(conversationState.rawValue))")
         conversationState = .inactive
         logStateChange(.inactive)
         isTyping = false
         currentTurnUserMessageID = nil
-        debugInfo = "Done (idle). Double-press to talk again."
+        debugInfo = "Done. Listening again…"
         mediaKeys.setPlaying()
+        scheduleStartListening(after: 1.5, reason: "turnFinished")
     }
 
     // MARK: - Logging

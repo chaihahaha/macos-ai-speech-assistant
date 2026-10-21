@@ -58,8 +58,10 @@
     为避免切速时把整段朗读弄丢/卡死，TTS 改为显式句子队列：`ttsQueue` + `currentlySpeakingText`，
     一次只喂一句给 `AVSpeechSynthesizer`；切速时把当前句放回队首、用新语速重播，队列其余句子保留。
     未在朗读时用独立 `speedAnnouncer` 播"快/慢"作为反馈，界面底部也会显示当前倍速。
-* **全程手动开始录音**：一轮回答结束、或被双击打断后，App 都停在 Idle，不再自动重新录音；
-  用户用双击手动进入录音状态。
+* **完成 = 自动进入下一轮**：正常回答播放完后，`finishTurn()` 置 `.inactive`，1.5s 后自动
+  `startListening()`，接着听下一轮。
+* **打断/撤销 = 停在 Idle**：双击打断、或 Idle 下右耳三击撤销后，不再自动重开录音；
+  用户用双击手动开始下一轮。
 * App 必须始终是 Now Playing App，这是该耳机按键唯一的投递路径；丢掉 Now Playing 就等于
   按键全灭。旧代码里"录音引擎 = 伪装播放引擎"导致麦克风常开、蓝牙在 A2DP/HFP 间切换、
   keep-alive 引擎挂掉 —— 这是"有时候双击也没反应"的真正原因。
@@ -77,8 +79,8 @@
 * **ASR 串行后台队列**：`ViewModel.asrQueue`，`Qwen3ASRModel` 非线程安全，必须串行。
 * **打断语义**：`.transcribing/.generating/.speaking` → `interruptConversation()` →
   停止 TTS / 取消 LLM / 删除本轮未完成对话 → **停在 Idle**（不再自动重开录音）。
-* **完成语义**：一轮回答结束后 `finishTurn()` 直接置 `.inactive` 并**停在 Idle**。
-  用户用双击手动开始下一轮。这样"Idle 时右耳三击撤销上一轮"才随时可用。
+* **完成语义**：正常回答结束后 `finishTurn()` 置 `.inactive` 并 `scheduleStartListening(1.5s)`
+  自动进入下一轮（对话循环）。打断/撤销不走这条路，停在 Idle。
 * **只删本轮**：`currentTurnUserMessageID` 记录本轮 user 消息，打断时只删这一轮；
   在 `.transcribing` 阶段（user 消息还没落库）打断不会误删上一轮。
 * **TTS 句子队列**：`ttsQueue` + `currentlySpeakingText`，一次只喂一句给
@@ -117,8 +119,8 @@ otool -s __TEXT __info_plist .build/debug/MyLlamaSpeechAssistant   # 必须能�
 
 ### 待用户确认 / 后续可做
 
-- [ ] 真机回归：双击开始/停止/打断；回答结束后停在 Idle；Idle 时右耳三击撤销上一轮；
-      进行中右耳三击切语速。
+- [ ] 真机回归：双击开始/停止/打断；正常回答结束后自动进入下一轮；打断后停在 Idle；
+      Idle 时右耳三击撤销上一轮；进行中右耳三击切语速。
 - [ ] 多段语音：VAD 第一次 `speechEnded` 就停止录音并启动静默计时，句中停顿会提前结束录音，
       属于既有设计，如需连续采集需另行改造。
 - [ ] `sendToOpencode` 里 `ensureOpencodeServer()` 最长会等 3s，这期间打断已可生效（generation 校验），
