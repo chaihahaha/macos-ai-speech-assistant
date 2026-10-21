@@ -295,3 +295,19 @@ otool -s __TEXT __info_plist .build/debug/MyLlamaSpeechAssistant   # 必须能�
 * `ViewModel.stopRecordingAndResumeKeepAlive()` 统一封装"停录音 + 恢复 keep-alive"。
 
 **排查口诀**：`capture started` 但没有 `TAP: first callback` → 检查进程里是不是还有另一个 engine 在跑。
+
+**补充：停止 keep-alive 后需要给音频设备约 0.5–1.5s 的 settle 时间**
+
+停止 keep-alive 引擎后**立刻** `engine.start()` 录音引擎，会出现：
+
+* `engine.start()` 直接挂住（实测 probe 卡死），或
+* 返回成功但随后 0 个 input 回调（app 日志：`TAP` 缺失，直到 60s 超时）。
+
+实测在停止 keep-alive 后等待 **0.5s / 1.5s** 都能稳定拿到 `callbacks=30`。因此
+`ViewModel.startListening()` 现在：
+
+1. `mediaKeys.pauseKeepAliveForRecording()`
+2. `Task.sleep(0.6s)`（期间状态保持 `listening`）
+3. 再次校验 `generation` 与 `state == .listening` 后才 `recorder.startRecording()`
+
+用户在这 0.6s 内双击会走 `stopConversation`，generation 改变，延迟任务自动作废。

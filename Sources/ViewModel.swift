@@ -360,10 +360,20 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             }
         }
 
+        // Stop the Now-Playing engine, then give the Bluetooth/Audio device a
+        // moment to settle. Starting the recorder in the same run-loop turn can
+        // make AVAudioEngine.start() hang or deliver zero input callbacks
+        // (the device is mid A2DP<->HFP switch). ~0.6s is enough in practice.
         mediaKeys.pauseKeepAliveForRecording()
-        recorder?.startRecording()
-        if recorder?.isRecording != true {
-            mediaKeys.resumeKeepAliveAfterRecording()
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard let self, self.isCurrent(gen), self.conversationState == .listening else {
+                return
+            }
+            self.recorder?.startRecording()
+            if self.recorder?.isRecording != true {
+                self.mediaKeys.resumeKeepAliveAfterRecording()
+            }
         }
     }
 

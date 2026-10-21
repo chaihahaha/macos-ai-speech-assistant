@@ -90,6 +90,8 @@
   Now Playing keep-alive；录音 engine 自带静音 player（attach/connect 必须在 start 之前）
   维持 Now Playing；停止录音后 stop+reset 录音 engine，再重建 keep-alive。
   两个 engine 同时开会令输入 tap 静默失败（见 PITFALL.md 第 11 节）。
+* **settle 延迟**：停掉 keep-alive 后立刻 start 录音引擎会挂起或 0 回调；`startListening`
+  现在 `pauseKeepAliveForRecording()` → `Task.sleep(0.6s)` → 校验 generation/state → `startRecording()`。
 * **配置持久化**：`applyBackendSettings()` 调用 `AppConfig.save()` 写回
   `~/.config/my-llama-speech-assistant/config.json`。此前 UI 里的 backend 切换只在内存生效，
   重启后又会回到 `~/.config` 的 `opencode`（而该机器上 opencode 服务没起），于是"切到 llamacpp
