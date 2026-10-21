@@ -13,3 +13,12 @@ conversation_history/
 *~
 __pycache__/
 *.pyc
+
+# 私人音频（绝不提交）
+/audios/
+*.m4a
+*.wav
+*.mp3
+*.aac
+*.caf
+*.flac

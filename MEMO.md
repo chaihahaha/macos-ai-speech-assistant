@@ -208,10 +208,10 @@ TEST_AUDIO_DIR="$PWD/audios" TEST_AUTO_START=1 ./.build/debug/MyLlamaSpeechAssis
   按实时 64ms/1024 sample 送入同一个 VAD/pipeline；文件尾追加 0.8s 静音触发 speechEnded。
 * 第一轮后保持会话；自动 listening 时喂下一个文件；第 4 次 start 时文件耗尽 →
   `onTestFinished` 打印 transcript 并退出。
-* 2026-10-22 01:19 实测（audios/新录音*.m4a）三轮全过：
-  1. ASR「你好，我的名字叫张三，请记住我的姓名。」→ 记住张三
-  2. ASR「你好，请问你还记得我的姓名叫什么吗？」→「我记得，你的名字叫张三。」
-  3. ASR「我刚才问了你什么问题？问了几个问题。」→ 正确复述上一轮问题并统计 3 条消息
+* 2026-10-22 实测三段本地测试录音，三轮全过：
+  1. 姓名记忆
+  2. 指代/回忆姓名
+  3. 复述上一轮问题并统计消息数
 * 日志：`~/source/ai_talk_ideas/conversation_*.log`；stdout 里有 `[TEST] files/feeding/transcript`。
 
 注意：文件模式绕过物理麦克风，验证的是 VAD/ASR/LLM/TTS/状态机；物理麦克风路径已由
