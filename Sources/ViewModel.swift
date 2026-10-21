@@ -361,7 +361,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                 guard let self, self.isCurrent(gen) else { return }
                 guard self.conversationState == .listening || self.conversationState == .waitingSilence else { return }
                 print("[VM] maxRecordingDuration reached")
-                self.pendingAudio = self.stopRecordingAndResumeKeepAlive()
+                self.pendingAudio = self.finishCaptureKeepingHFP()
                 self.cancelPendingWork(cancelPipeline: false)
                 self.launchPipeline(generation: gen)
             }
@@ -372,6 +372,14 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                 guard let self, self.isCurrent(gen) else { return }
                 self.onSpeechEnded(generation: gen)
             }
+        }
+
+        // Persistent HFP: the engine from the previous turn is still running.
+        // Just resume collecting; no A2DP<->HFP switch, no renegotiation.
+        if recorder?.isEngineRunning == true {
+            logConversation("[\(timestamp())] HFP: resume capture on existing engine")
+            recorder?.startRecording()
+            return
         }
 
         // Stop the Now-Playing engine, then give the Bluetooth/Audio device a
@@ -421,7 +429,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         isTyping = false
 
         recorder?.onSpeechEnded = nil
-        _ = stopRecordingAndResumeKeepAlive()
+        _ = stopRecordingFullyAndResumeA2DP()
 
         conversationState = .inactive
         logStateChange(.inactive)
@@ -512,10 +520,19 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         streamingComplete = false
     }
 
-    /// Stops the recorder and immediately restarts the output-only Now Playing
-    /// engine (only one AVAudioEngine at a time; see PITFALL.md #11).
+    /// End the utterance but keep the HFP engine running so the next turn does
+    /// not switch A2DP -> HFP again. TTS plays through the HFP output.
     @discardableResult
-    private func stopRecordingAndResumeKeepAlive() -> [Float] {
+    private func finishCaptureKeepingHFP() -> [Float] {
+        let samples = recorder?.finishCapture() ?? []
+        _ = headset.pinDefaults()
+        logConversation("[\(timestamp())] HFP: capture finished, engine kept for next turn")
+        return samples
+    }
+
+    /// Leave the conversation: tear down the HFP engine and bring A2DP back.
+    @discardableResult
+    private func stopRecordingFullyAndResumeA2DP() -> [Float] {
         let samples = recorder?.stopRecording() ?? []
         _ = headset.pinDefaults()
         mediaKeys.resumeKeepAliveAfterRecording()
@@ -552,7 +569,11 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         if noAutoResume {
             restartTask?.cancel()
             restartTask = nil
+            // Conversation over: release HFP and return to A2DP.
+            _ = stopRecordingFullyAndResumeA2DP()
         } else {
+            // Keep the HFP engine alive across turns; the next startListening()
+            // just resumes collecting on it.
             scheduleStartListening(after: 1.5, reason: "turnFinished")
         }
     }
@@ -831,7 +852,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         print("[VM] onSpeechEnded, state=\(conversationState.rawValue)")
 
         conversationState = .waitingSilence
-        pendingAudio = stopRecordingAndResumeKeepAlive()
+        pendingAudio = finishCaptureKeepingHFP()
 
         silenceTimerValue = appConfig.vad.silenceTimeout
         maxRecordingTimer?.invalidate()
@@ -925,7 +946,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             return
         }
 
-        _ = stopRecordingAndResumeKeepAlive()
+        _ = finishCaptureKeepingHFP()
 
         let trimmed = asrText.trimmingCharacters(in: .whitespacesAndNewlines)
         print("[VM] ASR result: '\(trimmed)' len=\(trimmed.count)")

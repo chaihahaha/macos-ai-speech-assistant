@@ -114,6 +114,9 @@
 * **不要自动 close/open 蓝牙**：只在链路真断开时 `openConnection`；音频设备暂时缺失只等待。
   `pinDefaults` 仅在默认设备不同时 set。capture 失败做软重试（等待+重 pin+重试一次），
   不再拆连接，避免"反复断开重连"的提示音和更糟的设备状态。
+* **持久 HFP 会话**：整个对话期间保持同一个 input-only engine（HFP），说完只
+  `finishCapture()` 保留 engine/tap，下一轮 `resumeCapture()`；不再每轮 A2DP↔HFP 切换。
+  TTS 在 HFP 里播放（通话音质）。只有 idle/打断/撤销才拆 engine 回 A2DP。
 * **录音时的三击不可行**：实测即使把静音 keep-alive 放内置扬声器、App 保持 Now Playing，
   录音（HFP）期间也收不到任何 AVRCP 事件 → 耳机固件在 HFP 下不发媒体键。该方案已回退
   （还会让 TTS 路由变噪音）。录音中退出只能用界面按钮。

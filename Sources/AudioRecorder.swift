@@ -18,6 +18,9 @@ final class AudioRecorder {
     private(set) var isRecording = false
     private(set) var audioLevel: Float = 0
 
+    /// True when the HFP capture engine is still running between turns.
+    var isEngineRunning: Bool { engine.isRunning && tapInstalled }
+
     var onSpeechEnded: (() -> Void)?
     /// Called once when the first audio buffer arrives (capture is really alive).
     /// The ViewModel uses this to start the silent Now-Playing engine *after*
@@ -85,6 +88,13 @@ final class AudioRecorder {
             report("[AudioRecorder] startRecording ignored (already recording)")
             return
         }
+        let reuse = tapInstalled && engine.isRunning
+        stateLock.unlock()
+        if reuse {
+            resumeCapture()
+            return
+        }
+        stateLock.lock()
         isRecording = true
         tapFireCount = 0
         captureToken &+= 1
@@ -111,13 +121,76 @@ final class AudioRecorder {
         beginCapture(token: token, attempt: 1)
     }
 
+    /// End the current utterance but **keep the HFP engine/tap running**, so the
+    /// headset stays in one profile and the next turn does not renegotiate
+    /// A2DP -> HFP (which is what made capture fail after a few turns).
     @discardableResult
-    func stopRecording() -> [Float] {
+    func finishCapture() -> [Float] {
         stateLock.lock()
         guard isRecording else {
             stateLock.unlock()
             return []
         }
+        isRecording = false
+        let fireCount = tapFireCount
+        stateLock.unlock()
+
+        stallTimer?.invalidate()
+        stallTimer = nil
+
+        sampleLock.lock()
+        let result = samples
+        let count = result.count
+        let peakValue = peak
+        samples.removeAll()
+        peak = 0
+        sampleLock.unlock()
+        report("[AudioRecorder] capture finished (engine kept alive): \(count) samples (\(String(format: "%.2f", Double(count) / targetSampleRate))s), peak=\(String(format: "%.4f", peakValue)), tapFireCount=\(fireCount)")
+        return result
+    }
+
+    /// Resume collecting on the already-running HFP engine.
+    func resumeCapture() {
+        stateLock.lock()
+        let canResume = !isRecording && tapInstalled && engine.isRunning
+        stateLock.unlock()
+        guard canResume else {
+            report("[AudioRecorder] resumeCapture: engine not reusable, starting fresh")
+            startRecording()
+            return
+        }
+
+        stateLock.lock()
+        isRecording = true
+        tapFireCount = 0
+        // Do NOT change captureToken: the installed tap captured the old token.
+        currentAttempt = 1
+        lastObservedTapCount = 0
+        stateLock.unlock()
+        lastTapChange = Date()
+
+        sampleLock.lock()
+        samples.removeAll()
+        peak = 0
+        periodPeak = 0
+        sampleLock.unlock()
+        consecutiveZeroPeakChecks = 0
+        stallCheckTicks = 0
+
+        speechActive = false
+        vadLock.lock()
+        vadProcessor.reset()
+        vadLock.unlock()
+        startStallMonitor()
+        report("[AudioRecorder] capture resumed on existing HFP engine")
+    }
+
+    @discardableResult
+    func stopRecording() -> [Float] {
+        stateLock.lock()
+        // Tear down even if the last utterance was already finished with
+        // finishCapture() (which keeps the engine alive for the next turn).
+        // Otherwise the HFP engine would stay open forever at idle.
         isRecording = false
         captureToken &+= 1 // invalidate any pending retry / watchdog
         let fireCount = tapFireCount

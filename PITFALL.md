@@ -563,3 +563,27 @@ App 确实是 Now Playing，但整段仍然**没有任何 `[MediaKeys]` 事件**
 同时，录音结束后从扬声器切回耳机 A2DP 的路由状态会让 TTS 变成噪音。该方案已回退：
 录音前仍 `pauseKeepAliveForRecording()`（停输出引擎），录音后 pin 耳机 + 重建 A2DP。
 TTS 只恢复了可听；三击在录音期间作为退出手段不可行，只能用界面按钮。
+
+---
+
+## 18. 每轮 A2DP↔HFP 切换才是根因；改为整个会话保持 HFP
+
+用户指出耳机能"一边播放一边麦克风"（视频通话）。这是对的，但那是 **HFP 双向音频**
+（单声道/16 kHz）；A2DP 只能输出、不能带麦克风。所以"mic + 播放"必然在 HFP 里，
+视频通话就是 HFP。App 之前每轮 TTS 用 A2DP、录音切 HFP，反复 profile 切换在这只耳机/
+macOS 上不可靠（第二轮起 16k 静音、44.1k 停摆）。
+
+**新架构（persistent HFP）**
+
+* 第一轮录音时启动一次 input-only `AVAudioEngine`（进入 HFP）。
+* 说完只 `finishCapture()`：停止收集样本，但**保留 engine + tap**，不 teardown。
+* TTS 在这个 HFP 会话里播放（通话音质，非音乐音质），不再切 A2DP。
+* 下一轮 `startListening()` 直接 `resumeCapture()` 复用同一个 engine/tap，
+  完全没有 profile 切换。
+* 只有真正离开会话（idle / 三击 / 打断 / 撤销）才 `stopRecording()` 拆 engine 并恢复
+  A2DP keep-alive。
+* `AudioRecorder` 新增 `isEngineRunning` / `finishCapture()` / `resumeCapture()`；
+  `startRecording()` 检测到 engine 还在跑时自动 resume。
+* 代价：会话期间 TTS 是 HFP 通话音质（16 kHz），麦克风一直开着（未收集时丢弃样本）。
+
+三击在 HFP 下仍然收不到（固件不发 AVRCP，见 #17）；录音中退出只能用界面按钮。
