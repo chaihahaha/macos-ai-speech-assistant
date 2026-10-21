@@ -67,6 +67,9 @@ final class MediaKeyController {
     /// True once the recorder has actually delivered its first buffer. Only then
     /// is it safe to start the output engine (input-first ordering).
     private var inputCaptureActive = false
+    /// True while AVSpeechSynthesizer owns the output route. The silent engine
+    /// must stay off so TTS starts cleanly and the route is free afterwards.
+    private var speechActive = false
 
     init() {
         setupRemoteCommands()
@@ -180,9 +183,9 @@ final class MediaKeyController {
         // way media keys reach us. The engine can die when the audio device is
         // reconfigured (Bluetooth A2DP <-> HFP when the mic opens), so restart
         // it when needed.
-        if recordingActive && !inputCaptureActive {
-            // Input not live yet: starting the output engine now would starve
-            // the recorder's input tap (output-first ordering).
+        if (recordingActive && !inputCaptureActive) || speechActive {
+            // Either the input is starting (output-first starves it) or TTS owns
+            // the route; do not touch the output engine.
         } else if silentEngine?.isRunning != true {
             silentRestartCount += 1
             if silentRestartCount <= 3 || silentRestartCount % 60 == 0 {
@@ -243,6 +246,27 @@ final class MediaKeyController {
     }
 
     // MARK: - Silent playback (keeps the app registered as "Now Playing")
+
+    /// Hand the output route to AVSpeechSynthesizer. The silent engine is
+    /// stopped so it cannot clip the first words or hold A2DP while TTS speaks.
+    func suspendKeepAliveForSpeech() {
+        speechActive = true
+        stopSilentPlayback()
+        log("[MediaKeys] keep-alive suspended for TTS")
+    }
+
+    /// TTS finished/stopped: bring the silent Now-Playing engine back (unless a
+    /// recording is in progress).
+    func resumeKeepAliveAfterSpeech() {
+        speechActive = false
+        guard !recordingActive else { return }
+        if silentEngine?.isRunning != true {
+            stopSilentPlayback()
+            startSilentPlayback()
+        }
+        setPlaying()
+        log("[MediaKeys] keep-alive resumed after TTS")
+    }
 
     /// Call immediately before starting the recording engine: the output-only
     /// engine must not be running when the input engine starts.

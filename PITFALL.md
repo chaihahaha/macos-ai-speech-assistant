@@ -441,3 +441,32 @@ attempt 1/3 input=16 kHz ... engine started ... TAP: first callback
 
 这能覆盖"启动成功但中途静默死掉"的情况；日志会显示
 `input stalled for X.Xs (callbacks=N); restarting capture` 以及后续 attempt 结果。
+
+---
+
+## 15. TTS/keep-alive 占着音频路由 → 下一轮 HFP 麦克风只出静音
+
+**日志证据（第二轮）**
+
+```
+attempt 1/3 input=16 kHz ... TAP ... level taps=16 periodPeak=0.0000   ← 全是静音
+attempt 2/3 input=44.1 kHz ... engineRunning=false                     ← 退到输出设备
+attempt 3/3 input=44.1 kHz ... capture failed
+```
+
+默认输入、采样率都对，但 16 kHz 的输入数据**全是 0**；说明耳机没有真正进入 HFP 音频，
+麦克风链路没建立。紧接着重试时引擎退回到 44.1 kHz 输出端点并停摆。
+
+**原因**
+
+上一轮回复结束后，`AVSpeechSynthesizer` 和静音 keep-alive 引擎仍在占用/切换输出路由；
+下一轮打开输入时蓝牙没有切到 HFP，拿到的是空输入。
+
+**修复**
+
+1. TTS 开始前 `MediaKeyController.suspendKeepAliveForSpeech()`：停掉静音 keep-alive，
+   让 `AVSpeechSynthesizer` 独占输出（同时避免它抢路由导致开头几个字被吞）。
+2. 第一句加 `preUtteranceDelay = 0.15`，给蓝牙路由切换留时间。
+3. 回复结束后 `enterIdle()` 里 `resumeKeepAliveAfterSpeech()` 重新起 keep-alive，并
+   `resetSpeechSynthesizer()` **替换** synthesizer，释放它占用的音频单元/路由。
+4. 录音引擎仍是 input-only；音频路由被释放后，下一轮的 16 kHz 输入应能拿到真实音频。

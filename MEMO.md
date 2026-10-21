@@ -100,6 +100,10 @@
   engine；`pingNowPlaying` 仍每 0.5s 重新断言 `nowPlayingInfo/playbackState`，但不重建
   output engine。停止录音后再 stop+restart output（回到 A2DP，TTS 可听）。
   待验证：录音期间右耳三击是否还能到达 App；若不行，需要另想退出方式。
+* **TTS 独占输出路由**：TTS 开始前停掉静音 keep-alive（`suspendKeepAliveForSpeech`），
+  第一句 `preUtteranceDelay=0.15`；回复结束后 `resumeKeepAliveAfterSpeech` +
+  `resetSpeechSynthesizer()`（替换 synthesizer 释放音频路由）。目标是让下一轮 HFP 输入
+  不再拿到全 0 的静音数据。
 * **TTS 诊断**：日志新增 `TTS-QUEUE` / `TTS-SPEAK` / `TTS-DONE`，用于确认是否有句子被丢弃
   或提前进入 Idle。
 * **capture 重试**：每次尝试用新的 `AVAudioEngine`；0.9s 没有 tap 回调就 teardown、

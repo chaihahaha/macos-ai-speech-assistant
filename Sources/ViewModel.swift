@@ -64,9 +64,12 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private let appConfig: AppConfig
     private var ttsRate: Float
 
-    private let speechSynthesizer = AVSpeechSynthesizer()
+    private var speechSynthesizer = AVSpeechSynthesizer()
     private var pendingSentence: String = ""
     private var hasStartedSpeaking = false
+    /// Whether the first utterance of the current turn has been fed (for the
+    /// Bluetooth route pre-delay).
+    private var didSpeakFirstUtterance = false
     /// Sentences waiting to be spoken. They are handed to
     /// `AVSpeechSynthesizer` one at a time so a speed change can restart the
     /// current sentence without losing the rest of the reply.
@@ -331,6 +334,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         pendingSentence = ""
         beepCount = 0
         hasStartedSpeaking = false
+        didSpeakFirstUtterance = false
         streamingComplete = false
         ttsQueue.removeAll()
         currentlySpeakingText = nil
@@ -394,6 +398,8 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         Task { await opencodeClient?.interrupt() }
 
         stopSynthesis()
+        mediaKeys.resumeKeepAliveAfterSpeech()
+        resetSpeechSynthesizer()
         isTyping = false
 
         recorder?.onSpeechEnded = nil
@@ -421,6 +427,8 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         ttsWaitAttempts = 0
 
         stopSynthesis()
+        mediaKeys.resumeKeepAliveAfterSpeech()
+        resetSpeechSynthesizer()
         isTyping = false
         gracefulExitPending = false
         llamaCppClient?.cancel()
@@ -466,6 +474,14 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             msg.id == userMsg.id || (msg.role == .assistant && msg.timestamp >= userMsg.timestamp)
         }
         currentTurnUserMessageID = nil
+    }
+
+    /// Replace the synthesizer so its audio route is released after a reply.
+    private func resetSpeechSynthesizer() {
+        speechSynthesizer.stopSpeaking(at: .immediate)
+        speechSynthesizer.delegate = nil
+        speechSynthesizer = AVSpeechSynthesizer()
+        speechSynthesizer.delegate = self
     }
 
     private func stopSynthesis() {
@@ -515,6 +531,8 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         isTyping = false
         currentTurnUserMessageID = nil
         debugInfo = text
+        mediaKeys.resumeKeepAliveAfterSpeech()
+        resetSpeechSynthesizer()
         mediaKeys.setPlaying()
         if noAutoResume {
             restartTask?.cancel()
@@ -922,6 +940,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
     private func resetSpeechPipelineState() {
         hasStartedSpeaking = false
+        didSpeakFirstUtterance = false
         pendingSentence = ""
         streamingComplete = false
         gracefulExitPending = false
@@ -1109,11 +1128,15 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        if !hasStartedSpeaking {
+        let isFirstUtterance = !hasStartedSpeaking
+        if isFirstUtterance {
             hasStartedSpeaking = true
             conversationState = .speaking
             logStateChange(.speaking)
             debugInfo = "Speaking..."
+            // TTS owns the output route now: stop the silent keep-alive so it
+            // cannot clip the first words or hold A2DP.
+            mediaKeys.suspendKeepAliveForSpeech()
         }
 
         ttsQueue.append(trimmed)
@@ -1138,6 +1161,12 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         }
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate * ttsRate
         utterance.volume = 1.0
+        if !didSpeakFirstUtterance {
+            // Give the Bluetooth route a moment to settle so the first syllable
+            // is not clipped.
+            utterance.preUtteranceDelay = 0.15
+            didSpeakFirstUtterance = true
+        }
 
         utteranceGenerations[ObjectIdentifier(utterance)] = generation
         logConversation("[\(timestamp())] TTS-SPEAK len=\(text.count) remaining=\(ttsQueue.count)")
