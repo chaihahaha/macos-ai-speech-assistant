@@ -782,6 +782,34 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             }
             self.recorder = recorder
 
+            // Headless three-round test: replay ./audios instead of the mic.
+            if let dir = ProcessInfo.processInfo.environment["TEST_AUDIO_DIR"] {
+                let dirURL = URL(fileURLWithPath: dir, isDirectory: true)
+                let urls = (try? FileManager.default.contentsOfDirectory(at: dirURL, includingPropertiesForKeys: nil))?
+                    .filter { $0.pathExtension.lowercased() == "m4a" } ?? []
+                func order(_ url: URL) -> Int {
+                    let name = url.deletingPathExtension().lastPathComponent
+                    if let range = name.range(of: #"(\d+)$"#, options: .regularExpression),
+                       let value = Int(name[range]) {
+                        return value
+                    }
+                    return 0
+                }
+                let sorted = urls.sorted { order($0) < order($1) }
+                recorder.testAudioFiles = sorted
+                print("[TEST] files: \(sorted.map { $0.lastPathComponent })")
+                recorder.onTestFinished = { [weak self] in
+                    Task { @MainActor [weak self] in
+                        print("[TEST] all files processed; transcript:")
+                        for message in self?.messages ?? [] {
+                            print("[TEST] \(message.role): \(message.text)")
+                        }
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        NSApplication.shared.terminate(nil)
+                    }
+                }
+            }
+
             loadingStatus = "Ready"
             debugInfo = "Models loaded (backend: \(selectedBackend))"
             logConversation("[\(timestamp())] MODELS: loaded, backend=\(selectedBackend)")
@@ -790,6 +818,13 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             loadingStatus = nil
         }
         isLoading = false
+
+        if ProcessInfo.processInfo.environment["TEST_AUTO_START"] == "1" {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                self?.startListening()
+            }
+        }
     }
 
     func applyBackendSettings() {

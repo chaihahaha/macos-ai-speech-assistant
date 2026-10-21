@@ -195,3 +195,24 @@ otool -s __TEXT __info_plist .build/debug/MyLlamaSpeechAssistant   # 必须能�
 - [ ] 撤销上一轮时会 `opencodeClient.reset()`：因为 opencode 的服务端会话无法只删最后一轮，
       这等于把服务端上下文整体丢弃（本地更早的消息仍保留在界面上）。如需保留更早上下文，
       需要 opencode 提供按消息删除/回滚的 API。
+
+## 自动化三轮语音测试（已通过）
+
+测试模式（生产代码内，env 开关）：
+
+```bash
+TEST_AUDIO_DIR="$PWD/audios" TEST_AUTO_START=1 ./.build/debug/MyLlamaSpeechAssistant
+```
+
+* `AudioRecorder.testAudioFiles` 非空时，用 `AVAudioFile` 读取每个 m4a，转成 16k mono，
+  按实时 64ms/1024 sample 送入同一个 VAD/pipeline；文件尾追加 0.8s 静音触发 speechEnded。
+* 第一轮后保持会话；自动 listening 时喂下一个文件；第 4 次 start 时文件耗尽 →
+  `onTestFinished` 打印 transcript 并退出。
+* 2026-10-22 01:19 实测（audios/新录音*.m4a）三轮全过：
+  1. ASR「你好，我的名字叫张三，请记住我的姓名。」→ 记住张三
+  2. ASR「你好，请问你还记得我的姓名叫什么吗？」→「我记得，你的名字叫张三。」
+  3. ASR「我刚才问了你什么问题？问了几个问题。」→ 正确复述上一轮问题并统计 3 条消息
+* 日志：`~/source/ai_talk_ideas/conversation_*.log`；stdout 里有 `[TEST] files/feeding/transcript`。
+
+注意：文件模式绕过物理麦克风，验证的是 VAD/ASR/LLM/TTS/状态机；物理麦克风路径已由
+`scripts/avcapture_probe.swift`（AVCaptureSession，250 buffers/5s，peak 0.366）验证。

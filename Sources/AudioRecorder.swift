@@ -12,8 +12,16 @@ final class AudioRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegat
     private(set) var isRecording = false
     private(set) var audioLevel: Float = 0
 
-    /// True when the HFP capture session is still running between turns.
-    var isEngineRunning: Bool { session?.isRunning == true }
+    /// True when the capture session (or the file-based test feed) is running.
+    var isEngineRunning: Bool {
+        if !testAudioFiles.isEmpty { return true }
+        return session?.isRunning == true
+    }
+
+    /// When non-empty, AudioRecorder replays these files instead of using the
+    /// microphone. Used by the headless three-round test.
+    var testAudioFiles: [URL] = []
+    var onTestFinished: (() -> Void)?
 
     var onSpeechEnded: (() -> Void)?
     var onSpeechStarted: (() -> Void)?
@@ -41,6 +49,9 @@ final class AudioRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegat
     private var captureToken = 0
     private var speechActive = false
     private var firstBufferWatchdog: DispatchWorkItem?
+    private var testFileIndex = 0
+    private var testPending: [Float] = []
+    private var testFeedToken = 0
 
     init(targetSampleRate: Double = 16000, vadProcessor: StreamingVADProcessor) {
         self.targetSampleRate = targetSampleRate
@@ -58,6 +69,10 @@ final class AudioRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegat
     // MARK: - Public API
 
     func startRecording() {
+        if !testAudioFiles.isEmpty {
+            startTestCapture()
+            return
+        }
         stateLock.lock()
         if isRecording {
             stateLock.unlock()
@@ -276,20 +291,8 @@ final class AudioRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegat
         stateLock.lock()
         let active = isRecording
         let isFirst = !didReportFirstBuffer && active
-        if isFirst { didReportFirstBuffer = true; bufferCount = 0 }
-        if active { bufferCount += 1 }
         stateLock.unlock()
         guard active else { return }
-
-        if isFirst {
-            var description = "unknown"
-            if let fd = CMSampleBufferGetFormatDescription(sampleBuffer),
-               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd)?.pointee {
-                description = "\(asbd.mSampleRate) Hz, \(asbd.mChannelsPerFrame) ch"
-            }
-            report("[AudioRecorder] TAP: first buffer (\(description))")
-            DispatchQueue.main.async { [weak self] in self?.onFirstTap?() }
-        }
 
         guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
         var length = 0
@@ -300,6 +303,25 @@ final class AudioRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegat
         guard floatCount > 0 else { return }
         let data = pointer.withMemoryRebound(to: Float.self, capacity: floatCount) {
             Array(UnsafeBufferPointer(start: $0, count: floatCount))
+        }
+        var description = "unknown"
+        if let fd = CMSampleBufferGetFormatDescription(sampleBuffer),
+           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd)?.pointee {
+            description = "\(asbd.mSampleRate) Hz, \(asbd.mChannelsPerFrame) ch"
+        }
+        processAudio(data, isFirst: isFirst, description: description)
+    }
+
+    /// Shared by AVCaptureSession and the file-based test feed.
+    private func processAudio(_ data: [Float], isFirst: Bool, description: String = "file") {
+        stateLock.lock()
+        if isFirst { didReportFirstBuffer = true }
+        bufferCount += 1
+        stateLock.unlock()
+
+        if isFirst {
+            report("[AudioRecorder] TAP: first buffer (\(description))")
+            DispatchQueue.main.async { [weak self] in self?.onFirstTap?() }
         }
 
         var sum: Float = 0
@@ -332,6 +354,111 @@ final class AudioRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegat
                 report("[VAD] Speech ended at \(String(format: "%.2f", segment.endTime))s (duration: \(String(format: "%.2f", segment.duration))s)")
                 speechActive = false
                 DispatchQueue.main.async { [weak self] in self?.onSpeechEnded?() }
+            }
+        }
+    }
+
+    // MARK: - File-based test feed
+
+    private func startTestCapture() {
+        stateLock.lock()
+        if isRecording {
+            stateLock.unlock()
+            return
+        }
+        isRecording = true
+        captureToken &+= 1
+        let token = captureToken
+        bufferCount = 0
+        didReportFirstBuffer = false
+        stateLock.unlock()
+
+        sampleLock.lock()
+        samples.removeAll()
+        peak = 0
+        sampleLock.unlock()
+        speechActive = false
+        vadLock.lock()
+        vadProcessor.reset()
+        vadLock.unlock()
+
+        guard testFileIndex < testAudioFiles.count else {
+            stateLock.lock()
+            isRecording = false
+            stateLock.unlock()
+            report("[TEST] all audio files processed")
+            DispatchQueue.main.async { [weak self] in self?.onTestFinished?() }
+            return
+        }
+
+        let url = testAudioFiles[testFileIndex]
+        testFileIndex += 1
+        report("[TEST] feeding \(url.lastPathComponent)")
+
+        do {
+            let file = try AVAudioFile(forReading: url)
+            let format = file.processingFormat
+            let capacity = AVAudioFrameCount(file.length)
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity) else {
+                throw NSError(domain: "AudioRecorder", code: 1, userInfo: [NSLocalizedDescriptionKey: "buffer alloc failed"])
+            }
+            try file.read(into: buffer)
+            var data: [Float]
+            if let channel = buffer.floatChannelData?[0] {
+                data = Array(UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)))
+            } else {
+                data = convertToTarget(buffer, from: format) ?? []
+            }
+            if abs(format.sampleRate - targetSampleRate) > 1 || format.channelCount != 1 {
+                data = convertToTarget(buffer, from: format) ?? data
+            }
+            // Append trailing silence so the VAD emits speechEnded.
+            data.append(contentsOf: [Float](repeating: 0, count: Int(targetSampleRate * 0.8)))
+            testPending = data
+            testFeedToken &+= 1
+            let feedToken = testFeedToken
+            feedTestChunk(token: token, feedToken: feedToken)
+        } catch {
+            report("[TEST] read failed: \(error)")
+            stateLock.lock()
+            isRecording = false
+            stateLock.unlock()
+            DispatchQueue.main.async { [weak self] in self?.onCaptureFailed?() }
+        }
+    }
+
+    private func convertToTarget(_ source: AVAudioPCMBuffer, from format: AVAudioFormat) -> [Float]? {
+        guard let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: targetSampleRate, channels: 1, interleaved: false),
+              let converter = AVAudioConverter(from: format, to: target) else { return nil }
+        let ratio = targetSampleRate / format.sampleRate
+        let capacity = AVAudioFrameCount(Double(source.frameLength) * ratio) + 16
+        guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return nil }
+        var provided = false
+        var error: NSError?
+        converter.convert(to: out, error: &error) { _, status in
+            if provided { status.pointee = .endOfStream; return nil }
+            provided = true
+            status.pointee = .haveData
+            return source
+        }
+        guard let channel = out.floatChannelData?[0] else { return nil }
+        return Array(UnsafeBufferPointer(start: channel, count: Int(out.frameLength)))
+    }
+
+    private func feedTestChunk(token: Int, feedToken: Int) {
+        stateLock.lock()
+        let active = isRecording && token == captureToken && feedToken == testFeedToken
+        stateLock.unlock()
+        guard active, !testPending.isEmpty else { return }
+
+        let count = min(1024, testPending.count)
+        let chunk = Array(testPending.prefix(count))
+        testPending.removeFirst(count)
+        processAudio(chunk, isFirst: !didReportFirstBuffer, description: "file")
+
+        if !testPending.isEmpty {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.064) { [weak self] in
+                self?.feedTestChunk(token: token, feedToken: feedToken)
             }
         }
     }
