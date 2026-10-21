@@ -23,7 +23,7 @@ final class AudioRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegat
     var testAudioFiles: [URL] = []
     var onTestFinished: (() -> Void)?
 
-    var onSpeechEnded: (() -> Void)?
+    var onSpeechEnded: ((TimeInterval) -> Void)?
     var onSpeechStarted: (() -> Void)?
     /// Called once per capture when the first audio buffer arrives.
     var onFirstTap: (() -> Void)?
@@ -353,7 +353,8 @@ final class AudioRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegat
             case .speechEnded(let segment):
                 report("[VAD] Speech ended at \(String(format: "%.2f", segment.endTime))s (duration: \(String(format: "%.2f", segment.duration))s)")
                 speechActive = false
-                DispatchQueue.main.async { [weak self] in self?.onSpeechEnded?() }
+                let duration = Double(segment.duration)
+                DispatchQueue.main.async { [weak self] in self?.onSpeechEnded?(duration) }
             }
         }
     }

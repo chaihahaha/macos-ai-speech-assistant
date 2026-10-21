@@ -23,8 +23,9 @@
    复用；只有 idle/打断/撤销才 `stopRunning` 并恢复 A2DP。避免每轮重新协商 HFP。
 8. **VAD 结束不能立刻停采集**：等待 silenceTimeout 期间继续收集；`onSpeechStarted` 时
    取消发送、继续收集，否则一句话只识别前半段。
-9. **沉默 ≠ 麦克风故障**：只有 0 回调才重试；静音/噪声用整段 RMS 门限（<0.003）判定，
-   超时直接回 idle，不把静音 clip 送 ASR（Qwen ASR 会在静音上编英文）。
+9. **沉默/噪声 ≠ 说话**：只有 0 回调才重试；送 ASR 前要求整段 **RMS ≥ 0.005**、
+   至少 **16 个 20 ms 有声帧**（帧 RMS > 0.006）且 VAD 段 ≥0.15 s；不满足直接回 idle，
+   不把静音/噪声 clip 送 ASR（Qwen ASR 会在静音上编英文）。
 10. **TTS**：keep-alive 与 TTS 共存才能听到（TTS 前停 keep-alive 会只剩噪音）；首句
     `preUtteranceDelay=0.15` 防吞字；TTS 走队列、逐句 `speak`，完成后再回 idle。
 
@@ -736,3 +737,26 @@ try inputNode.setVoiceProcessingEnabled(true)
 * 4 秒无首 buffer 才报 capture failed
 
 不要再回到 AVAudioEngine / VPIO / duplex / 强制采样率这些路径。
+
+
+---
+
+## 23. 最终 ASR 前置门限（环境噪声幻觉）
+
+`finishAndSend` / 录音超时在送 ASR 前统一检查：
+
+* 整段 **RMS ≥ 0.005**；
+* 至少 **16 个 20 ms 帧** 的帧 RMS > 0.006（约 320 ms 持续语音能量）；
+* VAD 段时长 ≥ 0.15 s（仅 VAD 正常结束路径）；
+* 不满足 → `SoundFeedback.timeout()` + `stopConversation()` 直接回 idle。
+
+实测（三段正常语音 vs 白噪声）：
+
+| 输入 | RMS | 有声帧 | 结果 |
+| --- | --- | --- | --- |
+| 语音 1/2/3 | 0.0108 / 0.0157 / 0.0113 | 150–165 | 通过 |
+| 白噪声 amplitude 0.004 | 0.0013 | 0 | 拒绝 |
+| 白噪声 amplitude 0.008 | 0.0026 | 0 | 拒绝 |
+| 白噪声 amplitude 0.012 | 0.0039 | 0 | 拒绝 |
+
+三段文件回放回归仍全过（上下文记忆/指代/上一轮问题复述均正确）。

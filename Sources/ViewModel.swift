@@ -115,6 +115,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private let mediaKeys = MediaKeyController()
     private let headset = HeadsetManager.shared
     private var captureRecoveryAttempts = 0
+    private var lastSpeechDuration: TimeInterval = 0
     private var captureRecoveryInProgress = false
 
     override init() {
@@ -365,13 +366,11 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                 guard self.conversationState == .listening || self.conversationState == .waitingSilence else { return }
                 print("[VM] maxRecordingDuration reached")
                 let audio = self.finishCaptureKeepingHFP()
-                var sum: Double = 0
-                for sample in audio { sum += Double(sample) * Double(sample) }
-                let rms = audio.isEmpty ? 0 : sqrt(sum / Double(audio.count))
-                if rms < 0.002 {
-                    // Long silence: go straight back to idle instead of sending
-                    // an empty clip through ASR/LLM.
-                    self.logConversation("[\(self.timestamp())] TIMEOUT: no speech (rms=\(String(format: "%.4f", rms))), returning to idle")
+                let stats = self.speechStats(audio)
+                if stats.rms < 0.005 || stats.loudFrames < 16 {
+                    // Long silence/noise: go straight back to idle instead of
+                    // sending an empty clip through ASR/LLM.
+                    self.logConversation("[\(self.timestamp())] TIMEOUT: no speech (rms=\(String(format: "%.4f", stats.rms)), loudFrames=\(stats.loudFrames)), returning to idle")
                     SoundFeedback.timeout()
                     self.stopConversation(caller: "recordingTimeoutSilence")
                     return
@@ -382,10 +381,10 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             }
         }
 
-        recorder?.onSpeechEnded = { [weak self] in
+        recorder?.onSpeechEnded = { [weak self] duration in
             Task { @MainActor [weak self] in
                 guard let self, self.isCurrent(gen) else { return }
-                self.onSpeechEnded(generation: gen)
+                self.onSpeechEnded(generation: gen, speechDuration: duration)
             }
         }
 
@@ -920,11 +919,12 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
     // MARK: - Recording callbacks
 
-    private func onSpeechEnded(generation gen: UInt64) {
+    private func onSpeechEnded(generation gen: UInt64, speechDuration: TimeInterval) {
         guard isCurrent(gen), conversationState == .listening else { return }
         print("[VM] onSpeechEnded, state=\(conversationState.rawValue)")
 
         conversationState = .waitingSilence
+        lastSpeechDuration = speechDuration
         // IMPORTANT: keep collecting during the silence wait. The VAD may end a
         // segment on a short pause; stopping the recorder here discarded the
         // rest of the sentence (ASR only got the first half).
@@ -965,15 +965,38 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         }
     }
 
+    /// RMS + number of 20 ms frames above a speech-level threshold.
+    private func speechStats(_ samples: [Float]) -> (rms: Double, loudFrames: Int) {
+        guard !samples.isEmpty else { return (0, 0) }
+        var sum = 0.0
+        for sample in samples { sum += Double(sample) * Double(sample) }
+        let rms = sqrt(sum / Double(samples.count))
+        let frameSize = 320 // 20 ms at 16 kHz
+        var loudFrames = 0
+        var index = 0
+        while index + frameSize <= samples.count {
+            var frameSum = 0.0
+            for i in index..<(index + frameSize) {
+                frameSum += Double(samples[i]) * Double(samples[i])
+            }
+            if sqrt(frameSum / Double(frameSize)) > 0.006 { loudFrames += 1 }
+            index += frameSize
+        }
+        return (rms, loudFrames)
+    }
+
     /// Finish the (still running) capture, reject pure noise/silence, then send.
     private func finishAndSend(generation gen: UInt64) {
         guard isCurrent(gen), conversationState == .waitingSilence else { return }
         let audio = finishCaptureKeepingHFP()
-        var sum: Double = 0
-        for sample in audio { sum += Double(sample) * Double(sample) }
-        let rms = audio.isEmpty ? 0 : sqrt(sum / Double(audio.count))
-        if rms < 0.003 {
-            logConversation("[\(timestamp())] SPEECH: no real speech (rms=\(String(format: "%.4f", rms))), idle")
+        let stats = speechStats(audio)
+        // Reject low-energy noise (ASR tends to invent English sentences) and
+        // very short blips. Real speech has both sustained RMS and many voiced
+        // 20 ms frames; ambient noise usually has neither.
+        let enoughEnergy = stats.rms >= 0.005 && stats.loudFrames >= 16
+        let longEnough = lastSpeechDuration >= 0.15
+        if !enoughEnergy || !longEnough {
+            logConversation("[\(timestamp())] SPEECH: rejected (rms=\(String(format: "%.4f", stats.rms)), loudFrames=\(stats.loudFrames), vadDuration=\(String(format: "%.2f", lastSpeechDuration)))")
             SoundFeedback.timeout()
             stopConversation(caller: "silenceAfterWait")
             return
