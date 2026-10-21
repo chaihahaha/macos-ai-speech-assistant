@@ -5,7 +5,7 @@ struct OpenCodeTest {
     static func main() async {
         FileHandle.standardError.write(Data("Starting OpenCodeTest...\n".utf8))
         let baseURL = "http://127.0.0.1:9999"
-        let directory = "~"
+        let directory = NSHomeDirectory()
 
         print("\n=== 1. Create session @ \(baseURL) ===")
         fflush(stdout)

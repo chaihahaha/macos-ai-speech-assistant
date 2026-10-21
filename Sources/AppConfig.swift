@@ -137,18 +137,14 @@ struct AppConfig: Codable, Sendable {
     }
 
     func resolvedASRPath() -> String {
-        let paths = [models.asrPath] + models.asrFallbackPaths
-        for p in paths {
-            if FileManager.default.fileExists(atPath: p) { return p }
-        }
-        return models.asrPath
+        let paths = ([models.asrPath] + models.asrFallbackPaths).map { ($0 as NSString).expandingTildeInPath }
+        for p in paths where FileManager.default.fileExists(atPath: p) { return p }
+        return paths.first ?? models.asrPath
     }
 
     func resolvedVADPath() -> String {
-        let paths = [models.vadPath] + models.vadFallbackPaths
-        for p in paths {
-            if FileManager.default.fileExists(atPath: p) { return p }
-        }
-        return models.vadPath
+        let paths = ([models.vadPath] + models.vadFallbackPaths).map { ($0 as NSString).expandingTildeInPath }
+        for p in paths where FileManager.default.fileExists(atPath: p) { return p }
+        return paths.first ?? models.vadPath
     }
 }

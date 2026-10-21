@@ -22,3 +22,6 @@ __pycache__/
 *.aac
 *.caf
 *.flac
+
+# 本机配置（含个人路径）
+config.json
