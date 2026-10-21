@@ -62,8 +62,11 @@ final class MediaKeyController {
 
     private var lastFireTime: [Action: Date] = [:]
     private var silentRestartCount = 0
-    /// True while the recorder's duplex engine owns the audio device.
+    /// True while the recorder owns the input path.
     private var recordingActive = false
+    /// True once the recorder has actually delivered its first buffer. Only then
+    /// is it safe to start the output engine (input-first ordering).
+    private var inputCaptureActive = false
 
     init() {
         setupRemoteCommands()
@@ -177,8 +180,9 @@ final class MediaKeyController {
         // way media keys reach us. The engine can die when the audio device is
         // reconfigured (Bluetooth A2DP <-> HFP when the mic opens), so restart
         // it when needed.
-        if recordingActive {
-            // The recorder engine owns the device and plays its own silence.
+        if recordingActive && !inputCaptureActive {
+            // Input not live yet: starting the output engine now would starve
+            // the recorder's input tap (output-first ordering).
         } else if silentEngine?.isRunning != true {
             silentRestartCount += 1
             if silentRestartCount <= 3 || silentRestartCount % 60 == 0 {
@@ -240,22 +244,37 @@ final class MediaKeyController {
 
     // MARK: - Silent playback (keeps the app registered as "Now Playing")
 
-    /// Call immediately before starting the recording engine. Two AVAudioEngines
-    /// where the output one starts first makes the input tap receive zero
-    /// callbacks (both engines end up not running). The recorder's own silent
-    /// player keeps us Now Playing during recording.
+    /// Call immediately before starting the recording engine: the output-only
+    /// engine must not be running when the input engine starts.
     func pauseKeepAliveForRecording() {
         recordingActive = true
+        inputCaptureActive = false
         stopSilentPlayback()
         log("[MediaKeys] keep-alive paused for recording")
     }
 
+    /// Called once the recorder has delivered its first buffer. Starting the
+    /// output engine only AFTER the input is live keeps the input tap alive
+    /// (the reverse order starves it) while keeping us Now Playing so media
+    /// keys still work during recording.
+    func startKeepAliveDuringRecording() {
+        recordingActive = true
+        inputCaptureActive = true
+        if silentEngine?.isRunning == true { return }
+        stopSilentPlayback()
+        startSilentPlayback()
+        setPlaying()
+        log("[MediaKeys] keep-alive started during recording (input-first)")
+    }
+
+    /// Stop the recorder first, then bring the output-only A2DP keep-alive back.
     func resumeKeepAliveAfterRecording() {
         recordingActive = false
-        if silentEngine?.isRunning != true {
-            stopSilentPlayback()
-            startSilentPlayback()
-        }
+        inputCaptureActive = false
+        // Restart unconditionally: the engine that ran during recording was bound
+        // to the HFP (16 kHz) output; TTS needs the A2DP output back.
+        stopSilentPlayback()
+        startSilentPlayback()
         setPlaying()
         log("[MediaKeys] keep-alive resumed after recording")
     }

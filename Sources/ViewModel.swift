@@ -605,6 +605,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         // This was the sentence we fed to the synthesizer; move on to the next
         // queued sentence, if any.
+        logConversation("[\(timestamp())] TTS-DONE remaining=\(ttsQueue.count) streamingComplete=\(streamingComplete)")
         currentlySpeakingText = nil
         if !ttsQueue.isEmpty {
             drainTTSQueue()
@@ -662,6 +663,11 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                     guard let self else { return }
                     self.errorMessage = "Microphone capture failed after retries. Check the input device / Bluetooth connection."
                     self.stopConversation(caller: "captureFailed")
+                }
+            }
+            recorder.onFirstTap = { [weak self] in
+                Task { @MainActor [weak self] in
+                    self?.mediaKeys.startKeepAliveDuringRecording()
                 }
             }
             self.recorder = recorder
@@ -1116,6 +1122,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         }
 
         ttsQueue.append(trimmed)
+        logConversation("[\(timestamp())] TTS-QUEUE len=\(trimmed.count) queued=\(ttsQueue.count)")
         drainTTSQueue()
     }
 
@@ -1138,6 +1145,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         utterance.volume = 1.0
 
         utteranceGenerations[ObjectIdentifier(utterance)] = generation
+        logConversation("[\(timestamp())] TTS-SPEAK len=\(text.count) remaining=\(ttsQueue.count)")
         speechSynthesizer.speak(utterance)
     }
 

@@ -19,6 +19,10 @@ final class AudioRecorder {
     private(set) var audioLevel: Float = 0
 
     var onSpeechEnded: (() -> Void)?
+    /// Called once when the first audio buffer arrives (capture is really alive).
+    /// The ViewModel uses this to start the silent Now-Playing engine *after*
+    /// the input engine, which avoids the output-first starvation.
+    var onFirstTap: (() -> Void)?
     /// Called when every capture attempt failed (no input callbacks at all).
     var onCaptureFailed: (() -> Void)?
     /// Diagnostics sink (the ViewModel writes these into the conversation log).
@@ -49,12 +53,6 @@ final class AudioRecorder {
     private static let tapWatchdogDelay: TimeInterval = 0.9
     /// Settle time between a failed attempt and the next one.
     private static let retryDelay: TimeInterval = 0.5
-
-    /// Silent looping player attached to the SAME engine as the input tap.
-    /// While recording this is the only AVAudioEngine in the process, so the
-    /// app stays "Now Playing" (media keys keep working) without a second
-    /// output engine that would starve the input tap.
-    private var keepAlivePlayer: AVAudioPlayerNode?
 
     init(targetSampleRate: Double = 16000, vadProcessor: StreamingVADProcessor) {
         self.targetSampleRate = targetSampleRate
@@ -163,8 +161,6 @@ final class AudioRecorder {
         }
         tapInstalled = true
 
-        prepareKeepAlivePlayer()
-
         do {
             try engine.start()
             report("[AudioRecorder] engine started")
@@ -174,7 +170,6 @@ final class AudioRecorder {
             return
         }
 
-        keepAlivePlayer?.play()
         report("[AudioRecorder] capture started (AVAudioEngine tap)")
 
         // If the tap never fires, we bound to a dead endpoint. Recreate the
@@ -215,8 +210,6 @@ final class AudioRecorder {
     }
 
     private func teardownEngine() {
-        keepAlivePlayer?.stop()
-        keepAlivePlayer = nil
         if tapInstalled {
             engine.inputNode.removeTap(onBus: 0)
             tapInstalled = false
@@ -243,6 +236,9 @@ final class AudioRecorder {
 
         if fireCount == 1 {
             report("[AudioRecorder] TAP: first callback, sampleRate=\(buffer.format.sampleRate), channels=\(buffer.format.channelCount)")
+            DispatchQueue.main.async { [weak self] in
+                self?.onFirstTap?()
+            }
         }
 
         let inputFormat = buffer.format
@@ -309,34 +305,6 @@ final class AudioRecorder {
             tapInstalled = false
         }
         engine.stop()
-    }
-
-    /// Attach a zero-volume looping player to the recording engine so macOS
-    /// keeps treating this process as the Now Playing app while the mic is open.
-    /// Must be called BEFORE `engine.start()`.
-    private func prepareKeepAlivePlayer() {
-        let format = engine.outputNode.inputFormat(forBus: 0)
-        guard format.channelCount > 0, format.sampleRate > 0 else {
-            report("[AudioRecorder] keep-alive player skipped: bad output format \(format)")
-            return
-        }
-        let player = AVAudioPlayerNode()
-        engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: format)
-        guard let silence = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1024),
-              let channels = silence.floatChannelData else {
-            report("[AudioRecorder] keep-alive player skipped: buffer allocation failed")
-            return
-        }
-        silence.frameLength = 1024
-        let bytes = Int(1024 * format.streamDescription.pointee.mBytesPerFrame)
-        for channel in 0..<Int(format.channelCount) {
-            memset(channels[channel], 0, bytes)
-        }
-        player.scheduleBuffer(silence, at: nil, options: .loops)
-        player.volume = 0
-        keepAlivePlayer = player
-        report("[AudioRecorder] keep-alive player prepared, output format=\(format)")
     }
 
     /// Diagnostics: which device does AVAudioEngine actually use as input?

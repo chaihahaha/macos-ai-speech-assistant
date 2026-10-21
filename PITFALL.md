@@ -371,3 +371,44 @@ otool -s __TEXT __info_plist .build/debug/MyLlamaSpeechAssistant   # 必须能�
 * TTS 语速固定为 `tts.fastRate`（高速），不再占用三击。
 * 如果三击在 HFP 下也被 Siri 抢走，则只能：用界面停止按钮、在厂商 App 改通话模式手势、
   或换独立麦克风让耳机保持 A2DP。
+
+---
+
+## 14. 录音引擎一旦连接 output（静音 player），输入会被绑到 44.1 kHz 输出设备
+
+**现象（第二轮）**
+
+```
+defaultInput=EDIFIER X Fit id=152 sr=16000
+attempt 1/3 input=<1 ch, 44100 Hz> ... engine started ... no input callbacks
+attempt 2/3 ... 44100 Hz ... no callbacks
+attempt 3/3 ... 44100 Hz ... capture failed
+```
+
+即设备明明是对的 16 kHz 输入，`AVAudioEngine` 却报 44.1 kHz，tap 永不触发。
+
+**原因**
+
+录音 engine 上连接了一个静音 `AVAudioPlayerNode`（为了维持 Now Playing）。AVAudioEngine
+会把整个 I/O 绑定到输出设备（A2DP 44.1k），于是 `inputNode.inputFormat` 变成 44.1k；而耳机
+的麦克风只在 HFP 16k 下可用，于是 tap 静默失败。
+
+**验证**
+
+同样的 post-TTS/A2DP 状态：
+
+* 录音 engine 带 output：input=44.1k，0 回调；
+* **input-only** engine：input=16k，`callbacks=30`。
+
+**修复**
+
+1. `AudioRecorder` 改为 **input-only**（不再连接静音 player）。
+2. 录音期间保持 Now Playing 改由**独立 output-only engine** 负责，但必须**在第一个 tap
+   回调之后**才启动（input-first）。顺序反了会饿死输入；input-first 时 probe 显示输入回调
+   持续正常。
+   * `AudioRecorder.onFirstTap` → `MediaKeyController.startKeepAliveDuringRecording()`。
+3. 停止录音：先停 input engine，再 `stopSilentPlayback()` + `startSilentPlayback()`
+   重建 output（回到 A2DP，TTS 才能正常出声）。
+
+**排查口诀**：`defaultInput` 对但 `input format` 是 44100 → 录音 engine 上是不是还挂着
+output 节点。

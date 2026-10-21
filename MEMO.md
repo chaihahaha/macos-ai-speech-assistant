@@ -89,10 +89,15 @@
   在 `.transcribing` 阶段（user 消息还没落库）打断不会误删上一轮。
 * **TTS 句子队列**：`ttsQueue` + `currentlySpeakingText`，一次只喂一句给
   `AVSpeechSynthesizer`；停止/退出时直接清空，不会卡在 `.speaking`。语速固定为 fastRate。
-* **单 engine 原则**：录音期间只允许录音 engine 运行。开始录音前停掉 output-only 的
-  Now Playing keep-alive；录音 engine 自带静音 player（attach/connect 必须在 start 之前）
-  维持 Now Playing；停止录音后 stop+reset 录音 engine，再重建 keep-alive。
-  两个 engine 同时开会令输入 tap 静默失败（见 PITFALL.md 第 11 节）。
+* **录音 engine 必须 input-only**：一旦在录音 engine 上连接静音 output player，AVAudioEngine
+  会把 I/O 绑到输出设备（A2DP 44.1k），`inputNode.inputFormat` 变成 44.1k，tap 永不触发
+  （即使 defaultInput 是 EDIFIER 16k）。现在录音 engine 不接 output。
+* **input-first 的 Now Playing**：第一个 tap 回调到达后再启动独立的 output-only keep-alive
+  引擎（`AudioRecorder.onFirstTap` → `MediaKeyController.startKeepAliveDuringRecording()`）。
+  输出先启动会饿死输入；输入先启动再开输出则正常（probe 验证）。停止录音时先停 input，
+  再 stop+restart output（回到 A2DP，TTS 可听）。
+* **TTS 诊断**：日志新增 `TTS-QUEUE` / `TTS-SPEAK` / `TTS-DONE`，用于确认是否有句子被丢弃
+  或提前进入 Idle。
 * **capture 重试**：每次尝试用新的 `AVAudioEngine`；0.9s 没有 tap 回调就 teardown、
   等 0.5s 重试（最多 3 次），并记录 `defaultInput`（设备/采样率）。全部失败走
   `onCaptureFailed` 显示错误。原因是蓝牙在 A2DP↔HFP 切换时可能绑定到 44.1k 的错误输入端点。
