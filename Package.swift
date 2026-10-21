@@ -19,6 +19,7 @@ let package = Package(
             exclude: ["LlamaStreamingDemo.entitlements", "Info.plist", "OpenCodeTest.swift"],
             linkerSettings: [
                 .linkedFramework("MediaPlayer"),
+                .linkedFramework("IOBluetooth"),
             ]
         ),
         .executableTarget(

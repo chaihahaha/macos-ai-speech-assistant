@@ -4,5 +4,7 @@
 <dict>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>This app needs microphone access for speech recognition</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>This app keeps the Bluetooth headset microphone and media keys working</string>
 </dict>
 </plist>

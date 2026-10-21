@@ -106,6 +106,11 @@
 * **强制 HFP**：`AudioRoute.preferHFPForInput()` 在录音前把默认蓝牙输出的 nominal rate
   设成 16000，促使耳机重新协商 HFP；录音结束 `restoreOutputRate()` 恢复原采样率。
   这是针对"多轮后 16k 输入全 0、重试退到 44.1k"的最后软件手段。
+* **耳机掉线/默认设备被抢**：`HeadsetManager`（IOBluetooth + CoreAudio）在启动、每次录音前、
+  TTS 前、停止录音后把 EDIFIER 的输入/输出 pin 成系统默认；音频设备不在时用
+  `openConnection()` 重连并等待；capture 失败自动 reconnect + 重试（最多 2 次）。
+  这解决了"默认输入变成 Virtual Desktop Mic（静音）/ 默认输出变成 Mac 扬声器（TTS 听不到）/
+  双击变 Siri"的一整类问题。
 * **TTS 诊断**：日志新增 `TTS-QUEUE` / `TTS-SPEAK` / `TTS-DONE`，用于确认是否有句子被丢弃
   或提前进入 Idle。
 * **capture 重试**：每次尝试用新的 `AVAudioEngine`；0.9s 没有 tap 回调就 teardown、

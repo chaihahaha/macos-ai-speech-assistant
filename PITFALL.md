@@ -481,3 +481,40 @@ HFP；停止录音后 `restoreOutputRate()` 恢复原采样率（通常 44.1 kHz
 
 注意：这是在系统层面短暂改变蓝牙输出采样率，会影响该设备上的其他音频；如果设备不支持或
 恢复失败，需要改用独立麦克风 / 扬声器输出方案。
+
+---
+
+## 16. 耳机掉线后 macOS 把默认输入/输出切到虚拟设备 → 随机 capture failed / TTS 听不到 / 双击变 Siri
+
+**决定性证据**
+
+用户说蓝牙断开后，CoreAudio 设备列表里已经没有 EDIFIER，默认设备变成：
+
+```
+default input  = Virtual Desktop Mic (44.1 kHz)
+default output = Mac mini扬声器
+```
+
+App 的 `defaultInput` 日志和录音引擎因此拿到的是**虚拟麦克风**（全静音）或 44.1 kHz 端点；
+TTS 也被送到 Mac 扬声器（耳机里听不到）。耳机不在默认输出/Now Playing 上，
+双击自然回到耳机固件的语音助手 → Siri。
+
+重新用 IOBluetooth `openConnection()` 连接后，EDIFIER 的音频设备（input 152 / output 146）
+回来；再把默认输入/输出 pin 到 EDIFIER，输入引擎立刻 `callbacks=30, peak=0.10`。
+
+**修复：`HeadsetManager`（IOBluetooth + CoreAudio）**
+
+* `pinDefaults()`：把名称含 EDIFIER 的输入/输出设备设为系统默认输入/输出。
+* `ensureReady()`：若音频设备不在，则对已配对的耳机 `openConnection()`，轮询最多 10s 等
+  音频设备出现并 pin。
+* `reconnect()`：先 `closeConnection()` 再 `openConnection()`，用于 capture 失败后的硬重置。
+* 接入点：
+  * 启动：`pinDefaults()` + 异步 `ensureReady()`，成功后重建 keep-alive（保证 Now Playing 在耳机上）。
+  * 每次录音前：`await ensureReady()`，失败则显示"Bluetooth headset not connected"而不是录虚拟麦克风。
+  * 每次 TTS 前：`pinDefaults()`，避免回复被送到 Mac 扬声器。
+  * 停止录音后：`pinDefaults()` 再恢复 A2DP keep-alive。
+  * capture 失败：自动 `reconnect()` + 重试（最多 2 次）。
+* Package 增加 `IOBluetooth` framework；Info.plist 增加 `NSBluetoothAlwaysUsageDescription`。
+
+**注意**：如果耳机真的关机/超出范围，App 现在会明确报"蓝牙耳机未连接"，不会静默录虚拟麦克风。
+虚拟音频软件（Immersed / Virtual Desktop）仍可能抢默认设备；App 在关键操作前会重新 pin。

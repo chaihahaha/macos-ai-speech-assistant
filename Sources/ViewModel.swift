@@ -112,6 +112,9 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private var currentTurnUserMessageID: UUID?
 
     private let mediaKeys = MediaKeyController()
+    private let headset = HeadsetManager.shared
+    private var captureRecoveryAttempts = 0
+    private var captureRecoveryInProgress = false
 
     override init() {
         appConfig = AppConfig.load()
@@ -154,7 +157,16 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             // Not emitted by this headset; kept for other AVRCP devices.
             previousTrack: { [weak self] in self?.handleTriplePress() }
         )
+        _ = headset.pinDefaults()
         mediaKeys.becomeNowPlaying()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let ready = await self.headset.ensureReady()
+            self.logConversation("[\(self.timestamp())] HEADSET: launch ensureReady=\(ready)")
+            if ready {
+                self.mediaKeys.resumeKeepAliveAfterRecording()
+            }
+        }
     }
 
     deinit {
@@ -372,6 +384,13 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             guard let self, self.isCurrent(gen), self.conversationState == .listening else {
                 return
             }
+            let ready = await self.headset.ensureReady()
+            guard ready, self.isCurrent(gen), self.conversationState == .listening else {
+                self.logConversation("[\(self.timestamp())] HEADSET: not ready for recording")
+                self.errorMessage = "Bluetooth headset not connected. Reconnect it and try again."
+                self.stopConversation(caller: "headsetNotReady")
+                return
+            }
             self.recorder?.startRecording()
             if self.recorder?.isRecording != true {
                 self.mediaKeys.resumeKeepAliveAfterRecording()
@@ -497,6 +516,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @discardableResult
     private func stopRecordingAndResumeKeepAlive() -> [Float] {
         let samples = recorder?.stopRecording() ?? []
+        _ = headset.pinDefaults()
         mediaKeys.resumeKeepAliveAfterRecording()
         return samples
     }
@@ -672,9 +692,32 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             }
             recorder.onCaptureFailed = { [weak self] in
                 Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    self.errorMessage = "Microphone capture failed after retries. Check the input device / Bluetooth connection."
+                    guard let self, !self.captureRecoveryInProgress else { return }
+                    self.captureRecoveryAttempts += 1
+                    self.logConversation("[\(self.timestamp())] HEADSET: capture failed, recovery attempt \(self.captureRecoveryAttempts)")
+                    self.errorMessage = "Microphone capture failed; reconnecting the Bluetooth headset…"
                     self.stopConversation(caller: "captureFailed")
+                    guard self.captureRecoveryAttempts <= 2 else {
+                        self.errorMessage = "Bluetooth headset not connected. Reconnect it and try again."
+                        return
+                    }
+                    self.captureRecoveryInProgress = true
+                    let ok = await self.headset.reconnect()
+                    self.captureRecoveryInProgress = false
+                    if ok {
+                        self.errorMessage = nil
+                        self.debugInfo = "Headset reconnected. Listening…"
+                        self.logConversation("[\(self.timestamp())] HEADSET: reconnected, retrying recording")
+                        self.startListening()
+                    } else {
+                        self.errorMessage = "Bluetooth headset not connected. Reconnect it and try again."
+                        self.logConversation("[\(self.timestamp())] HEADSET: reconnect failed")
+                    }
+                }
+            }
+            recorder.onFirstTap = { [weak self] in
+                Task { @MainActor [weak self] in
+                    self?.captureRecoveryAttempts = 0
                 }
             }
             self.recorder = recorder
@@ -1128,6 +1171,9 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             conversationState = .speaking
             logStateChange(.speaking)
             debugInfo = "Speaking..."
+            // Ensure the reply goes to the headset, not to a virtual device that
+            // may have stolen the system default output.
+            _ = headset.pinDefaults()
         }
 
         ttsQueue.append(trimmed)
