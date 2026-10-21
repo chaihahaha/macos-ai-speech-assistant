@@ -1,20 +1,23 @@
 import Foundation
 import AppKit
+import ApplicationServices
 import MediaPlayer
 import AVFoundation
 
 /// Receives the hardware media keys (play/pause, next, previous) and forwards
 /// them to the app as simple, *deduplicated* callbacks.
 ///
-/// Why the deduplication exists: a single physical media-key press can be
-/// delivered to us through up to three independent channels — the global
-/// `NSEvent` monitor, the local `NSEvent` monitor and the `MPRemoteCommandCenter`
-/// (via `playCommand` / `pauseCommand` / `togglePlayPauseCommand`). Without
-/// deduplication one press fires the handler two or three times, which used to
-/// be papered over by a 500 ms debounce in `ViewModel`. That debounce also
-/// swallowed legitimate rapid presses, so the fix is to deduplicate the
-/// *duplicate deliveries of one press* here (a short window) and let the
-/// business logic respond to every real press immediately.
+/// A single physical press can be delivered through up to four independent
+/// channels: a `CGEvent` tap, the global `NSEvent` monitor, the local `NSEvent`
+/// monitor and the `MPRemoteCommandCenter`. Without deduplication one press
+/// fires the handler several times, which used to be papered over by a 500 ms
+/// debounce in `ViewModel`. That debounce also swallowed legitimate rapid
+/// presses, so duplicates are collapsed here (per action, 500 ms) and the
+/// business logic responds to every real press immediately.
+///
+/// The CGEvent tap is the most reliable channel for Bluetooth headsets, which
+/// often deliver only a subset of presses through the other channels. It needs
+/// Accessibility permission; when it is unavailable we fall back gracefully.
 @MainActor
 final class MediaKeyController {
     enum Action: Hashable {
@@ -23,13 +26,26 @@ final class MediaKeyController {
         case previous
     }
 
-    /// Window within which repeat deliveries of the same action are treated as
-    /// one physical key press. The original code used 500 ms for this in
-    /// `ViewModel` because one press can be delivered through several channels;
-    /// we keep the same empirically-safe width but collapse the duplicates at
-    /// the source, so the business logic no longer has to debounce (and no
-    /// longer swallows legitimate presses for *every* state).
+    private struct DecodedMediaKey {
+        let code: Int
+        let down: Bool
+        let repeatFlag: Bool
+    }
+
+    /// See the type documentation. 500 ms matches the window the previous
+    /// implementation used to hide duplicate deliveries.
     private static let dedupInterval: TimeInterval = 0.5
+
+    /// `NX_KEYTYPE_*` codes carried by `NX_SYSDEFINED` events.
+    private enum NXKey {
+        static let play = 16
+        static let next = 17
+        static let previous = 18
+    }
+
+    /// Optional sink for diagnostics (the ViewModel writes these into the
+    /// conversation log so headset-specific problems can be diagnosed later).
+    var logHandler: ((String) -> Void)?
 
     private var onPlayPause: (() -> Void)?
     private var onNextTrack: (() -> Void)?
@@ -42,13 +58,16 @@ final class MediaKeyController {
     private var silentEngine: AVAudioEngine?
     private var silentPlayer: AVAudioPlayerNode?
     private var eventTap: CFMachPort?
+    private var eventTapSource: CFRunLoopSource?
 
     private var lastFireTime: [Action: Date] = [:]
+    private var silentRestartCount = 0
 
     init() {
         setupRemoteCommands()
         setupEventMonitors()
         setupCGEventTap()
+        log("[MediaKeys] initialized (Xcode accessibility trusted=\(AXIsProcessTrusted()))")
     }
 
     func setHandlers(playPause: @escaping () -> Void,
@@ -59,19 +78,23 @@ final class MediaKeyController {
         onPreviousTrack = previousTrack
     }
 
+    private func log(_ message: String) {
+        print(message)
+        logHandler?(message)
+    }
+
     // MARK: - Dispatch
 
-    /// Single funnel for every trigger (NSEvent, MPRemote, Space). Deduplicates
-    /// the same action fired twice within `dedupInterval` so one physical press
-    /// results in exactly one handler call.
+    /// Single funnel for every trigger. Deduplicates the same action fired twice
+    /// within `dedupInterval` so one physical press results in one handler call.
     private func fire(_ action: Action, source: String) {
         let now = Date()
         if let last = lastFireTime[action], now.timeIntervalSince(last) < Self.dedupInterval {
-            print("[MediaKeys] (\(source)) \(action) deduplicated (\(String(format: "%.3f", now.timeIntervalSince(last)))s)")
+            log("[MediaKeys] (\(source)) \(action) deduplicated (\(String(format: "%.3f", now.timeIntervalSince(last)))s)")
             return
         }
         lastFireTime[action] = now
-        print("[MediaKeys] (\(source)) \(action) fired")
+        log("[MediaKeys] (\(source)) \(action) fired")
 
         switch action {
         case .playPause:
@@ -83,12 +106,25 @@ final class MediaKeyController {
         }
     }
 
+    private func dispatchMediaKey(code: Int, source: String) {
+        switch code {
+        case NXKey.play:
+            fire(.playPause, source: source)
+        case NXKey.next:
+            fire(.next, source: source)
+        case NXKey.previous:
+            fire(.previous, source: source)
+        default:
+            log("[MediaKeys] \(source): unknown keyCode=\(code), ignoring")
+        }
+    }
+
     // MARK: - Now Playing
 
     func becomeNowPlaying() {
         setNowPlayingInfo()
         startSilentPlayback()
-        print("[MediaKeys] Now Playing activated, playbackState=.playing")
+        log("[MediaKeys] Now Playing activated, playbackState=.playing")
         keepAliveTimer?.invalidate()
         keepAliveTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.pingNowPlaying() }
@@ -117,24 +153,47 @@ final class MediaKeyController {
     func assertNowPlaying() {
         let center = MPNowPlayingInfoCenter.default()
         if center.nowPlayingInfo == nil || center.playbackState != .playing {
-            print("[MediaKeys] Re-asserting Now Playing (was nil or not .playing)")
+            log("[MediaKeys] Re-asserting Now Playing (was nil or not .playing)")
             setNowPlayingInfo()
         }
     }
 
     private func pingNowPlaying() {
         let center = MPNowPlayingInfoCenter.default()
+
+        // The keep-alive engine is what makes macOS treat us as the Now Playing
+        // app — and for AVRCP headsets (e.g. EDIFIER X Fit) that is the *only*
+        // way media keys reach us. The engine can die when the audio device is
+        // reconfigured (Bluetooth A2DP <-> HFP when the mic opens), so restart
+        // it when needed.
+        if silentEngine?.isRunning != true {
+            silentRestartCount += 1
+            if silentRestartCount <= 3 || silentRestartCount % 60 == 0 {
+                log("[MediaKeys] keep-alive engine not running (attempt \(silentRestartCount)); restarting")
+            }
+            silentPlayer?.stop()
+            silentEngine?.stop()
+            silentEngine = nil
+            silentPlayer = nil
+            startSilentPlayback()
+        } else {
+            silentRestartCount = 0
+        }
+
+        // Keep reporting playback so the system does not hand media keys to
+        // another app.
+        if center.playbackState != .playing {
+            center.playbackState = .playing
+        }
+
         guard var info = center.nowPlayingInfo else {
-            print("[MediaKeys] nowPlayingInfo was nil, re-asserting!")
+            log("[MediaKeys] nowPlayingInfo was nil, re-asserting!")
             setNowPlayingInfo()
             return
         }
-        let playing = center.playbackState == .playing
-        if playing {
-            let t = info[MPNowPlayingInfoPropertyElapsedPlaybackTime] as? Double ?? 0
-            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = t + 0.5
-        }
-        info[MPNowPlayingInfoPropertyPlaybackRate] = playing ? 1.0 : 0.0
+        let t = info[MPNowPlayingInfoPropertyElapsedPlaybackTime] as? Double ?? 0
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = t + 0.5
+        info[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
         center.nowPlayingInfo = info
     }
 
@@ -146,6 +205,8 @@ final class MediaKeyController {
         }
     }
 
+    /// Kept for API symmetry; the app intentionally stays `.playing` so macOS
+    /// keeps routing the hardware media keys here.
     func setPaused() {
         let center = MPNowPlayingInfoCenter.default()
         center.playbackState = .paused
@@ -176,7 +237,7 @@ final class MediaKeyController {
         engine.connect(player, to: engine.mainMixerNode, format: format)
 
         guard let silence = makeSilenceBuffer(format: format) else {
-            print("[MediaKeys] Silent playback skipped: bad output format")
+            log("[MediaKeys] Silent playback skipped: bad output format \(format)")
             return
         }
 
@@ -187,9 +248,9 @@ final class MediaKeyController {
             player.play()
             silentEngine = engine
             silentPlayer = player
-            print("[MediaKeys] Silent playback started")
+            log("[MediaKeys] Silent playback started (output-only engine)")
         } catch {
-            print("[MediaKeys] Silent playback failed: \(error)")
+            log("[MediaKeys] Silent playback failed: \(error)")
         }
     }
 
@@ -198,30 +259,7 @@ final class MediaKeyController {
         silentEngine?.stop()
         silentEngine = nil
         silentPlayer = nil
-        print("[MediaKeys] Silent playback stopped")
-    }
-
-    func sharedAudioEngine() -> AVAudioEngine {
-        if let engine = silentEngine { return engine }
-        let engine = AVAudioEngine()
-        let player = AVAudioPlayerNode()
-        let format = engine.outputNode.inputFormat(forBus: 0)
-        engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: format)
-        if let silence = makeSilenceBuffer(format: format) {
-            do {
-                try engine.start()
-                player.scheduleBuffer(silence, at: nil, options: .loops)
-                player.volume = 0.0
-                player.play()
-                silentEngine = engine
-                silentPlayer = player
-                print("[MediaKeys] Silent playback started (lazy)")
-            } catch {
-                print("[MediaKeys] Silent playback failed: \(error)")
-            }
-        }
-        return engine
+        log("[MediaKeys] Silent playback stopped")
     }
 
     private func makeSilenceBuffer(format: AVAudioFormat) -> AVAudioPCMBuffer? {
@@ -273,13 +311,8 @@ final class MediaKeyController {
         center.seekBackwardCommand.addTarget(handler: previous)
         center.skipBackwardCommand.addTarget(handler: previous)
 
-        center.stopCommand.addTarget { _ in
-            print("[MediaKeys] MPRemote: stopCommand")
-            return .success
-        }
-        center.changePlaybackPositionCommand.addTarget { _ in
-            return .success
-        }
+        center.stopCommand.addTarget { _ in .success }
+        center.changePlaybackPositionCommand.addTarget { _ in .success }
         center.likeCommand.addTarget { _ in .success }
         center.dislikeCommand.addTarget { _ in .success }
         center.bookmarkCommand.addTarget { _ in .success }
@@ -301,7 +334,7 @@ final class MediaKeyController {
         center.dislikeCommand.isEnabled = false
         center.bookmarkCommand.isEnabled = false
 
-        print("[MediaKeys] MPRemoteCommandCenter configured")
+        log("[MediaKeys] MPRemoteCommandCenter configured")
     }
 
     private func dispatchOnMainActor(_ block: @escaping (MediaKeyController) -> Void) {
@@ -337,55 +370,90 @@ final class MediaKeyController {
             return nil
         }
 
-        print("[MediaKeys] Global + Local event monitors installed")
+        log("[MediaKeys] Global + Local NSEvent monitors installed")
     }
 
     private func handleSystemEvent(_ event: NSEvent, source: String) {
-        guard event.subtype.rawValue == 8 else { return }
+        guard let key = Self.decodeMediaKey(event) else { return }
+        guard key.down else { return }
+        if key.repeatFlag {
+            log("[MediaKeys] NSEvent(\(source)): keyCode=\(key.code) repeat ignored")
+            return
+        }
+        log("[MediaKeys] NSEvent(\(source)): keyCode=\(key.code) DOWN")
+        dispatchMediaKey(code: key.code, source: "NSEvent.\(source)")
+    }
 
-        let keyCode = (event.data1 & 0xFFFF_0000) >> 16
-        let keyState = (event.data2 & 0xFF00) >> 8
-        let keyRepeat = (event.data2 & 0x00FF) != 0
+    /// Decodes an `NX_SYSDEFINED` event. The flags normally live in the low 16
+    /// bits of `data1`, but some delivery paths surface them in `data2`; both
+    /// layouts are accepted.
+    private static func decodeMediaKey(_ event: NSEvent) -> DecodedMediaKey? {
+        guard event.subtype.rawValue == 8 else { return nil }
+        let data1 = UInt32(truncatingIfNeeded: event.data1)
+        let code = Int((data1 & 0xFFFF_0000) >> 16)
+        var flags = data1 & 0x0000_FFFF
+        if flags == 0 {
+            flags = UInt32(truncatingIfNeeded: event.data2)
+        }
+        let state = (flags & 0xFF00) >> 8
+        let repeatFlag = (flags & 0x00FF) != 0
+        return DecodedMediaKey(code: code, down: state == 0x0A, repeatFlag: repeatFlag)
+    }
 
-        let stateLabel: String = {
-            switch keyState {
-            case 0x0A: return "DOWN"
-            case 0x0B: return "UP"
-            default: return String(format: "0x%02X", keyState)
-            }
-        }()
+    // MARK: - CGEvent tap
 
-        // Ignore key-up and auto-repeat; only the initial key-down matters.
-        guard keyState == 0x0A, !keyRepeat else {
-            if keyState == 0x0A && keyRepeat {
-                print("[MediaKeys] NSEvent(\(source)): keyCode=\(keyCode) repeat ignored")
-            }
+    private func setupCGEventTap() {
+        guard AXIsProcessTrusted() else {
+            log("[MediaKeys] CGEvent tap unavailable: Accessibility permission not granted. " +
+                "Grant it in System Settings ▸ Privacy & Security ▸ Accessibility for reliable Bluetooth media keys.")
             return
         }
 
-        print("[MediaKeys] NSEvent(\(source)): keyCode=\(keyCode) (0x\(String(keyCode, radix: 16))) state=\(stateLabel)")
-
-        let NX_KEYTYPE_PLAY: Int = 16
-        let NX_KEYTYPE_NEXT: Int = 17
-        let NX_KEYTYPE_PREVIOUS: Int = 18
-
-        switch keyCode {
-        case NX_KEYTYPE_PLAY:
-            fire(.playPause, source: "NSEvent.\(source)")
-        case NX_KEYTYPE_NEXT:
-            fire(.next, source: "NSEvent.\(source)")
-        case NX_KEYTYPE_PREVIOUS:
-            fire(.previous, source: "NSEvent.\(source)")
-        default:
-            print("[MediaKeys] unknown keyCode=\(keyCode), ignoring")
+        let mask = CGEventMask(1 << 14) // NX_SYSDEFINED
+        let callback: CGEventTapCallBack = { _, type, event, refcon in
+            guard let refcon else { return Unmanaged.passUnretained(event) }
+            let controller = Unmanaged<MediaKeyController>.fromOpaque(refcon).takeUnretainedValue()
+            return controller.handleCGEventTap(type: type, event: event)
         }
+
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: callback,
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
+        ) else {
+            log("[MediaKeys] CGEvent tap creation failed")
+            return
+        }
+
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        eventTap = tap
+        eventTapSource = source
+        log("[MediaKeys] CGEvent tap installed (NX_SYSDEFINED, pass-through)")
     }
 
-    private func setupCGEventTap() {
-        // CGEvent tap intentionally disabled: it requires Accessibility
-        // permission and can freeze the whole session if the tap callback is
-        // slow. NSEvent monitors + MPRemoteCommandCenter are sufficient.
-        print("[MediaKeys] CGEvent tap skipped (using NSEvent monitors + MPRemote)")
+    /// Runs on the main run loop; events are observed but **not** consumed so
+    /// other apps keep receiving them.
+    private func handleCGEventTap(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+            log("[MediaKeys] CGEvent tap was disabled by the system; re-enabled")
+            return Unmanaged.passUnretained(event)
+        }
+        guard type.rawValue == 14, let nsEvent = NSEvent(cgEvent: event),
+              let key = Self.decodeMediaKey(nsEvent) else {
+            return Unmanaged.passUnretained(event)
+        }
+        guard key.down, !key.repeatFlag else {
+            return Unmanaged.passUnretained(event)
+        }
+        log("[MediaKeys] CGEventTap: keyCode=\(key.code) DOWN")
+        dispatchMediaKey(code: key.code, source: "CGEventTap")
+        return Unmanaged.passUnretained(event)
     }
 
     deinit {
@@ -393,7 +461,15 @@ final class MediaKeyController {
         silentPlayer?.stop()
         silentEngine?.stop()
         silentEngine = nil
-        if let tap = eventTap { CFMachPortInvalidate(tap) }
+        if let source = eventTapSource {
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
+            eventTapSource = nil
+        }
+        if let tap = eventTap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+            CFMachPortInvalidate(tap)
+            eventTap = nil
+        }
         if let m = globalEventMonitor { NSEvent.removeMonitor(m) }
         if let m = localEventMonitor { NSEvent.removeMonitor(m) }
         if let m = spaceKeyMonitor { NSEvent.removeMonitor(m) }

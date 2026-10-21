@@ -122,9 +122,19 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     private func setupMediaKeys() {
+        // Persist media-key diagnostics into the conversation log so problems
+        // with a specific headset can be diagnosed after the fact.
+        mediaKeys.logHandler = { [weak self] message in
+            self?.logConversation(message)
+        }
         mediaKeys.setHandlers(
             playPause: { [weak self] in self?.handlePlayPause() },
-            nextTrack: { [weak self] in self?.toggleTTSSpeed() },
+            // The EDIFIER X Fit (and many AVRCP headsets) report a *double*
+            // press on one earbud as `nextTrack`. Treat it as the same primary
+            // action so double-click is not silently "do nothing".
+            nextTrack: { [weak self] in self?.handlePlayPause() },
+            // A triple press reports as `previousTrack` on headsets that send
+            // it at all; keep it for the TTS speed toggle.
             previousTrack: { [weak self] in self?.toggleTTSSpeed() }
         )
         mediaKeys.becomeNowPlaying()
@@ -308,7 +318,10 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         conversationState = .inactive
         logStateChange(.inactive)
-        mediaKeys.setPaused()
+        // Keep reporting `.playing`: macOS only routes the hardware media keys
+        // to the app that currently owns Now Playing. Reporting `.paused` made
+        // single presses get swallowed by the system.
+        mediaKeys.setPlaying()
         debugInfo = "Stopped"
     }
 
@@ -457,6 +470,15 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
     // MARK: - TTS delegate
 
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let preview = utterance.speechString.prefix(24)
+            print("[TTS] didStart: \(preview)")
+            self.logConversation("[\(self.timestamp())] TTS-START: \(preview)")
+        }
+    }
+
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
         Task { @MainActor [weak self] in
             self?.handleUtteranceFinished(utterance)
@@ -516,7 +538,9 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                 stepRatio: 1.0
             )
             let processor = StreamingVADProcessor(model: vad, config: vadConfig)
-            recorder = AudioRecorder(targetSampleRate: 16000, vadProcessor: processor, engine: mediaKeys.sharedAudioEngine())
+            // Dedicated capture engine (NOT the Now-Playing engine): stopping
+            // it releases the microphone so Bluetooth can leave HFP mode.
+            recorder = AudioRecorder(targetSampleRate: 16000, vadProcessor: processor)
 
             loadingStatus = "Ready"
             debugInfo = "Models loaded (backend: \(selectedBackend))"

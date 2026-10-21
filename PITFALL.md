@@ -133,3 +133,28 @@ tap 回调先检查 active 标志，停止后立即返回。
   等同于向系统宣称支持却什么都不做；现统一设为 `false`（不支持的不要注册）。
 * keep-alive 每 0.5s 把 `PlaybackRate` 强制写回 1.0，即使已 `.paused`，会让系统认为仍在播放。
   现根据 `playbackState` 决定 rate 与是否推进 elapsed time。
+
+---
+
+## 8. 蓝牙耳机（EDIFIER X Fit）的按键只走 AVRCP/MediaRemote，且必须先当上 Now Playing App
+
+**实测（`scripts/HeadsetMonitor.swift`）**
+
+* 耳机按键**不会**产生 HID 输入、`NX_SYSDEFINED` 或 NSEvent 系统事件；
+  唯一来源是 `MPRemoteCommandCenter` 的 `play` / `pause` / `nextTrack`。
+* 同一时间键盘事件能被 CGEventTap 正常记录，所以不是权限问题。
+* 手势映射（逐条按顺序实测）：左耳单击 ✅ `play/pause`；左耳双击/三击 ❌ 无任何信号；
+  右耳单击 ✅ `play/pause`；右耳双击 ✅ `nextTrack`；右耳三击 ❌ 无信号。
+
+**结论**
+
+1. 这类耳机**只有 App 是 Now Playing App 时**才能收到按键；一旦丢掉 Now Playing，按键全灭。
+   所以 `MPNowPlayingInfoCenter` 的 info/state 必须持续保持，且 keep-alive 用的静音
+   `AVAudioEngine` 必须是 output-only、不能被录音 tap 污染，并要能自愈重启。
+2. 旧实现把录音引擎和伪装播放引擎合成一个：`installTap` 让麦克风常开，蓝牙在 A2DP/HFP
+   之间来回切，keep-alive 引擎在设备重配时挂掉 → 丢 Now Playing → "有时候按了没反应"。
+   现改为录音使用独立 engine，并在 `stopRecording()` 里 `engine.stop()` 释放麦克风。
+3. 不要因为"暂停了"就把 `playbackState` 设成 `.paused`：本 App 是语音助手，必须持续
+   接收按键。`pingNowPlaying` 每 0.5s 重新断言 `.playing` 并重启挂掉的 keep-alive 引擎。
+4. 左耳双击/三击、右耳三击在 Mac 侧**根本没有事件**，属于耳机固件/厂商 App 的手势分配，
+   软件层无法修复（很可能被分配给了 Siri/语音助手）。诊断脚本可用于确认任意耳机的行为。

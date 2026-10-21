@@ -23,6 +23,34 @@
 | 6 | 音频 tap 重复安装 / 重复移除 | 竞态下抛 ObjC 异常崩溃 | `AudioRecorder` |
 | 7 | 空格键 monitor 吞掉 TextField 里的空格 | 设置面板无法输入空格 | `MediaKeyController.setupEventMonitors` |
 | 8 | Now Playing keep-alive 强制 rate=1.0；无效命令仍 isEnabled | 暂停状态被系统误判，媒体键可能被路由走 | `MediaKeyController` |
+| 9 | 录音引擎与伪装播放引擎是同一个 `AVAudioEngine`，停止录音时不 `engine.stop()` | 麦克风常开 → 蓝牙停留在 HFP；keep-alive 引擎在 A2DP/HFP 切换时挂掉 → 丢 Now Playing → 媒体键失效；TTS 走 HFP 可能完全听不到 | `AudioRecorder` / `ViewModel.loadModels` |
+| 10 | 停止会话时把 `playbackState` 设为 `.paused` | macOS 可能不再把媒体键投给本 App | `ViewModel.stopConversation` |
+| 11 | 右耳双击 = `nextTrack` 被映射为 TTS 语速 | 双击看起来"没反应" | `ViewModel.setupMediaKeys` |
+
+### 真机诊断：EDIFIER X Fit（蓝牙）按键实测
+
+用 `scripts/HeadsetMonitor.swift`（`binaries/HeadsetMonitor`）实测，结论：
+
+* 该耳机**只通过蓝牙 AVRCP → MediaRemote** 传递按键；HID / `NX_SYSDEFINED` / NSEvent 通道
+  **完全没有信号**（同一时间键盘事件能被 CGEventTap 正常捕获，排除权限问题）。
+* 逐一手势对应关系（用户按顺序按键 + 日志时间戳完全吻合）：
+
+| 手势 | Mac 收到的命令 | 结果 |
+| --- | --- | --- |
+| 左耳单击 | `pause` / `play` | ✅ |
+| 左耳双击 | **无** | ❌ 固件层未发给 Mac（很可能被分配给 Siri/语音助手） |
+| 左耳三击 | **无** | ❌ |
+| 右耳单击 | `pause` / `play` | ✅ |
+| 右耳双击 | `nextTrack` | ✅ |
+| 右耳三击 | **无** | ❌ |
+
+* 因此：**App 必须始终是 Now Playing App**，这是该耳机按键唯一的投递路径；丢掉 Now Playing
+  就等于按键全灭。旧代码里"录音引擎 = 伪装播放引擎"导致麦克风常开、蓝牙在 A2DP/HFP 间切换、
+  keep-alive 引擎挂掉 —— 这就是"有时候单击没反应"的真正原因。
+* 左耳双击/三击、右耳三击在 Mac 侧收不到任何事件，**软件无法修复**；需在 EDIFIER Connect
+  之类的厂商 App 里改手势分配，或接受该限制。
+* 右耳双击 = `nextTrack`，已改为与单击相同的会话开关（否则双击只会静默切换 TTS 语速，
+  看起来就像"没反应"）。
 
 ### 关键设计决策
 

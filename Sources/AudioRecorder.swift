@@ -5,17 +5,26 @@ import SpeechVAD
 /// Captures microphone audio through an `AVAudioEngine` tap, converts it to
 /// 16 kHz mono float samples and feeds it to the streaming VAD.
 ///
-/// The lifecycle is deliberately idempotent: `startRecording()` on an already
-/// running recorder is a no-op (installing a second tap on the same bus raises
-/// an Objective-C exception), and `stopRecording()` on a stopped recorder
-/// returns no samples instead of removing a tap that was never installed.
+/// The recorder owns a **dedicated** engine. It must not share the engine that
+/// keeps the app registered as "Now Playing": as soon as an input tap is
+/// installed on an engine, macOS opens the microphone and Bluetooth headsets
+/// switch from A2DP to HFP (hands-free / call mode). If that engine keeps
+/// running after recording, the microphone stays open — output then goes
+/// through the headset's call path (often silent) and the headset's button
+/// changes from media keys to call controls.
+///
+/// The lifecycle is also idempotent: `startRecording()` on an already running
+/// recorder is a no-op (installing a second tap on the same bus raises an
+/// Objective-C exception), and `stopRecording()` on a stopped recorder returns
+/// no samples instead of removing a tap that was never installed.
 final class AudioRecorder {
     private(set) var isRecording = false
     private(set) var audioLevel: Float = 0
 
     var onSpeechEnded: (() -> Void)?
 
-    private let engine: AVAudioEngine
+    /// Dedicated engine — only ever used for microphone capture.
+    private let engine = AVAudioEngine()
     private var samples: [Float] = []
     /// Protects `samples`.
     private let sampleLock = NSLock()
@@ -29,10 +38,9 @@ final class AudioRecorder {
     private var speechActive = false
     private var tapFireCount: Int = 0
 
-    init(targetSampleRate: Double = 16000, vadProcessor: StreamingVADProcessor, engine: AVAudioEngine) {
+    init(targetSampleRate: Double = 16000, vadProcessor: StreamingVADProcessor) {
         self.targetSampleRate = targetSampleRate
         self.vadProcessor = vadProcessor
-        self.engine = engine
     }
 
     func startRecording() {
@@ -60,19 +68,14 @@ final class AudioRecorder {
 
         let inputNode = engine.inputNode
         let inputFormat = inputNode.inputFormat(forBus: 0)
-        print("[AudioRecorder] input device: \(inputNode), format=\(inputFormat)")
+        print("[AudioRecorder] input format=\(inputFormat), sampleRate=\(inputFormat.sampleRate), channels=\(inputFormat.channelCount)")
 
-        if !engine.isRunning {
-            do {
-                try engine.start()
-                print("[AudioRecorder] engine started")
-            } catch {
-                print("[AudioRecorder] engine start failed: \(error)")
-                stateLock.lock()
-                isRecording = false
-                stateLock.unlock()
-                return
-            }
+        guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
+            print("[AudioRecorder] no usable microphone format; aborting recording")
+            stateLock.lock()
+            isRecording = false
+            stateLock.unlock()
+            return
         }
 
         guard let recordingFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
@@ -94,6 +97,20 @@ final class AudioRecorder {
             self.stateLock.unlock()
             guard active else { return }
             self.handleTap(buffer: buffer, converter: converter, recordingFormat: recordingFormat)
+        }
+
+        if !engine.isRunning {
+            do {
+                try engine.start()
+                print("[AudioRecorder] engine started")
+            } catch {
+                print("[AudioRecorder] engine start failed: \(error)")
+                inputNode.removeTap(onBus: 0)
+                stateLock.lock()
+                isRecording = false
+                stateLock.unlock()
+                return
+            }
         }
 
         print("[AudioRecorder] capture started (AVAudioEngine tap)")
@@ -171,9 +188,12 @@ final class AudioRecorder {
         let fireCount = tapFireCount
         stateLock.unlock()
 
+        // Remove the tap and stop the engine completely: this is what releases
+        // the microphone and lets a Bluetooth headset return to A2DP.
         engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
         audioLevel = 0
-        print("[AudioRecorder] stopRecording called, tapFireCount=\(fireCount)")
+        print("[AudioRecorder] stopRecording called, tapFireCount=\(fireCount), engine stopped")
 
         sampleLock.lock()
         let result = samples
@@ -191,6 +211,7 @@ final class AudioRecorder {
         stateLock.unlock()
         if active {
             engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
         }
     }
 }

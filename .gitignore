@@ -5,6 +5,7 @@ conversation_history/
 # 临时与日志（AGENTS.md 约定）
 /tmp/
 /logs/
+/binaries/
 
 # 系统与编辑器
 .DS_Store
