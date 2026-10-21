@@ -4,6 +4,38 @@
 
 ---
 
+## 0. TL;DR — 最关键的 10 个坑
+
+1. **构建**：必须 `--build-system native` + `-sectcreate __TEXT __info_plist`；否则二进制没有
+   内嵌 Info.plist，麦克风会静默失效。
+2. **蓝牙媒体键**：只走 AVRCP/MPRemote，App 必须是 Now Playing；HFP 通话模式下耳机固件
+   根本不发媒体键（双击变 Siri，三击收不到），录音中退出只能用界面按钮。
+3. **异步状态机**：所有延迟重启/回调都要带 generation token，否则打断后旧任务会"复活"。
+4. **默认音频设备会被抢**：Immersed/Virtual Desktop 等会改变系统默认输入/输出；
+   `HeadsetManager` 在启动、录音前、TTS 前把 EDIFIER pin 回来；只有蓝牙链路真断开时才
+   `openConnection()`，不要自动 close/open（会制造反复断开重连）。
+5. **A2DP 不能带麦克风**：mic + 播放只能走 HFP（视频通话就是 HFP）。每轮 A2DP↔HFP
+   切换是第二轮起 capture 失败的根因；正确做法是整个会话保持同一个 HFP 采集会话。
+6. **AVAudioEngine 在这只耳机上无解**：input-only 给 16 kHz 全 0；duplex 给 0 回调；
+   VPIO 把电平压到 0.000x。最终改用 **AVCaptureSession**（视频通话同款），实测
+   5 秒 250 buffers、peak 0.37。
+7. **录音会话跨轮保持**：说完只停止"收集"（`finishCapture`），session 不拆；下一轮直接
+   复用；只有 idle/打断/撤销才 `stopRunning` 并恢复 A2DP。避免每轮重新协商 HFP。
+8. **VAD 结束不能立刻停采集**：等待 silenceTimeout 期间继续收集；`onSpeechStarted` 时
+   取消发送、继续收集，否则一句话只识别前半段。
+9. **沉默 ≠ 麦克风故障**：只有 0 回调才重试；静音/噪声用整段 RMS 门限（<0.003）判定，
+   超时直接回 idle，不把静音 clip 送 ASR（Qwen ASR 会在静音上编英文）。
+10. **TTS**：keep-alive 与 TTS 共存才能听到（TTS 前停 keep-alive 会只剩噪音）；首句
+    `preUtteranceDelay=0.15` 防吞字；TTS 走队列、逐句 `speak`，完成后再回 idle。
+
+**遗留**：环境噪声偶尔仍会让 ASR 幻觉出英文。现有 RMS 门限（0.003/0.002）可继续调高，
+或对短片段/低能量片段直接丢弃；VAD onset 也可调保守一些。
+
+**回归方式**：`TEST_AUDIO_DIR="$PWD/audios" TEST_AUTO_START=1 ./.build/debug/MyLlamaSpeechAssistant`
+在 tmux 里跑三轮文件回放，日志看 `~/source/ai_talk_ideas/conversation_*.log`。
+
+---
+
 ## 1. 构建：默认 SwiftPM 构建系统编译 mlx-swift 的 Metal kernel 失败
 
 **现象**
