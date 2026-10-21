@@ -342,6 +342,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         conversationState = .listening
         logStateChange(.listening)
+        SoundFeedback.start()
         errorMessage = nil
         debugInfo = "Listening... (\(Int(appConfig.vad.silenceTimeout))s silence to send)"
 
@@ -371,6 +372,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                     // Long silence: go straight back to idle instead of sending
                     // an empty clip through ASR/LLM.
                     self.logConversation("[\(self.timestamp())] TIMEOUT: no speech, returning to idle")
+                    SoundFeedback.timeout()
                     self.stopConversation(caller: "recordingTimeoutSilence")
                     return
                 }
@@ -870,6 +872,19 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         conversationState = .waitingSilence
         pendingAudio = finishCaptureKeepingHFP()
 
+        // Guard against VAD false positives / ASR hallucinations on silence:
+        // if the captured clip has no real energy, go idle instead of sending
+        // an empty clip (Qwen ASR tends to invent English sentences on silence).
+        var capturedPeak: Float = 0
+        for sample in pendingAudio { capturedPeak = max(capturedPeak, abs(sample)) }
+        if capturedPeak < 0.005 {
+            self.logConversation("[\(self.timestamp())] SPEECH: false end (peak=\(String(format: "%.4f", capturedPeak))), idle")
+            SoundFeedback.timeout()
+            stopConversation(caller: "falseSpeechSilence")
+            return
+        }
+
+        SoundFeedback.waiting()
         silenceTimerValue = appConfig.vad.silenceTimeout
         maxRecordingTimer?.invalidate()
         maxRecordingTimer = nil
@@ -881,8 +896,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                 guard let self, self.isCurrent(gen) else { return }
                 self.beepCount += 1
                 self.silenceTimerValue = max(0, self.silenceTimerValue - 1)
-                self.beepSound?.stop()
-                self.beepSound?.play()
                 if self.silenceTimerValue <= 0 {
                     self.beepTimer?.invalidate()
                     self.beepTimer = nil
@@ -908,6 +921,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     private func launchPipeline(generation gen: UInt64) {
+        SoundFeedback.transcribe()
         pipelineTask?.cancel()
         pipelineTask = Task { @MainActor [weak self] in
             await self?.processAndSend(generation: gen)

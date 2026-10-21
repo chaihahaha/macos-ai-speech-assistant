@@ -599,3 +599,28 @@ macOS 上不可靠（第二轮起 16k 静音、44.1k 停摆）。
 * 默认 60s（`recordingTimeout`，设置面板可改）；
 * 超时后如果整段音频 peak < 0.003（一直没说话），直接 `stopConversation` 回 idle，
   不再跑 ASR/LLM；有声音才进管线。
+
+---
+
+## 19. 静音时 VAD 假结束 → ASR 幻觉出英文，且永远不回 idle
+
+现象：长时间不说话，App 会输入从未说过的英文句子，且一直不进 idle。
+
+原因链：
+
+1. Silero VAD 把环境噪声当成语音，触发 `onSpeechEnded`；
+2. `onSpeechEnded` 立刻 `maxRecordingTimer.invalidate()`，真正的录音超时被取消；
+3. 静音音频被送进 ASR；Qwen3-ASR 在静音上会"脑补"英文句子；
+4. 幻觉文本进入 LLM → TTS → 自动再 listening，循环，永远 idle 不了。
+
+修复：
+
+* `onSpeechEnded` 先算 `pendingAudio` 的 peak；`peak < 0.005` 判定为假结束 →
+  `SoundFeedback.timeout()` + `stopConversation()` 回 idle，**不送 ASR**。
+* 录音超时路径同样检查 peak（<0.003）→ 直接 idle，不跑 ASR/LLM。
+* 提示音改为：
+  * 开始录音：`Pop` 一次；
+  * 说完进入 waiting：`Tink` 一次；
+  * 开始 transcribe：`Morse` 一次；
+  * 超时/假结束回 idle：`Basso` 一次。
+  删除了原先每秒一次的倒计时 `Tink`。

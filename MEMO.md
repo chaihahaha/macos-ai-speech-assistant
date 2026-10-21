@@ -124,6 +124,9 @@
   （可配置，设置面板）时若无语音（peak<0.003）直接回 idle；有语音才进 ASR。
 * **设置面板**：TTS 语速 slider（tts.fastRate）和录音超时（vad.maxRecordingDuration）
   可在齿轮设置里改，Apply 持久化。
+* **静音幻觉**：VAD 假结束时若音频 peak<0.005，直接 idle，不送 ASR（Qwen ASR 会在静音上
+  编英文）；录音超时无语音同样直接 idle。提示音：开始 Pop / 等待 Tink / 转写 Morse /
+  超时 Basso，各一次，取消每秒倒计时音。
 * **失败提示音**：capture 失败播 Basso、软重试进入 listening 播 Glass，避免用户干等。
 * **驱动不可行**：macOS kext 已废弃/需关 SIP，DriverKit 不提供通用蓝牙音频/HFP 驱动；
   蓝牙音频由闭源 bluetoothd + coreaudiod 管理。HAL 虚拟声卡仍走同一蓝牙栈，无法绕过
