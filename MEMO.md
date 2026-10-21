@@ -92,6 +92,9 @@
 * **录音 engine 必须 input-only**：一旦在录音 engine 上连接静音 output player，AVAudioEngine
   会把 I/O 绑到输出设备（A2DP 44.1k），`inputNode.inputFormat` 变成 44.1k，tap 永不触发
   （即使 defaultInput 是 EDIFIER 16k）。现在录音 engine 不接 output。
+* **capture stall watchdog**：录音中每 0.5s 检查 tap 回调是否有增长；0 回调 >1.0s 或
+  已有回调但 >1.2s 无新回调 → teardown + 新 engine 重试（最多 3 次）。解决"第二轮只收到
+  一个 buffer 就静默停止、界面卡 listening"。
 * **录音期间不跑 output 引擎**：实践表明在输入引擎运行后再启动 output-only
   keep-alive 会导致不稳定（第二轮回调中断/主线程卡住）。现在录音期间只跑 input-only
   engine；`pingNowPlaying` 仍每 0.5s 重新断言 `nowPlayingInfo/playbackState`，但不重建

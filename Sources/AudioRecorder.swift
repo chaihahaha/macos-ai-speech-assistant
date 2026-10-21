@@ -49,10 +49,16 @@ final class AudioRecorder {
     private var captureToken = 0
 
     private static let maxCaptureAttempts = 3
-    /// How long to wait for the first tap callback before declaring the attempt dead.
-    private static let tapWatchdogDelay: TimeInterval = 0.9
     /// Settle time between a failed attempt and the next one.
     private static let retryDelay: TimeInterval = 0.5
+    private static let stallCheckInterval: TimeInterval = 0.5
+    private static let firstTapTimeout: TimeInterval = 1.0
+    private static let stallTimeout: TimeInterval = 1.2
+
+    private var stallTimer: Timer?
+    private var currentAttempt = 0
+    private var lastObservedTapCount = 0
+    private var lastTapChange = Date()
 
     init(targetSampleRate: Double = 16000, vadProcessor: StreamingVADProcessor) {
         self.targetSampleRate = targetSampleRate
@@ -94,6 +100,7 @@ final class AudioRecorder {
         vadLock.unlock()
         report("[AudioRecorder] VAD reset")
 
+        startStallMonitor()
         beginCapture(token: token, attempt: 1)
     }
 
@@ -109,6 +116,8 @@ final class AudioRecorder {
         let fireCount = tapFireCount
         stateLock.unlock()
 
+        stallTimer?.invalidate()
+        stallTimer = nil
         teardownEngine()
 
         sampleLock.lock()
@@ -131,6 +140,11 @@ final class AudioRecorder {
         // (wrong) input format/endpoint after a Bluetooth profile switch.
         engine = AVAudioEngine()
         tapInstalled = false
+        currentAttempt = attempt
+        stateLock.lock()
+        lastObservedTapCount = tapFireCount
+        stateLock.unlock()
+        lastTapChange = Date()
         let inputNode = engine.inputNode
         let inputFormat = inputNode.inputFormat(forBus: 0)
         report("[AudioRecorder] attempt \(attempt)/\(Self.maxCaptureAttempts) input=\(inputFormat) defaultInput=\(defaultInputInfo())")
@@ -171,19 +185,6 @@ final class AudioRecorder {
         }
 
         report("[AudioRecorder] capture started (AVAudioEngine tap)")
-
-        // If the tap never fires, we bound to a dead endpoint. Recreate the
-        // engine and try again after the device settles.
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.tapWatchdogDelay) { [weak self] in
-            guard let self else { return }
-            self.stateLock.lock()
-            let active = self.isRecording && token == self.captureToken
-            let fires = self.tapFireCount
-            self.stateLock.unlock()
-            guard active, fires == 0 else { return }
-            self.report("[AudioRecorder] no input callbacks after \(Self.tapWatchdogDelay)s")
-            self.scheduleRetry(token: token, attempt: attempt, reason: "tap watchdog")
-        }
     }
 
     private func scheduleRetry(token: Int, attempt: Int, reason: String) {
@@ -192,6 +193,8 @@ final class AudioRecorder {
 
         guard attempt < Self.maxCaptureAttempts else {
             report("[AudioRecorder] capture failed after \(attempt) attempts (\(reason))")
+            stallTimer?.invalidate()
+            stallTimer = nil
             stateLock.lock()
             isRecording = false
             captureToken &+= 1
@@ -207,6 +210,39 @@ final class AudioRecorder {
             guard let self, self.isCurrentCapture(token) else { return }
             self.beginCapture(token: token, attempt: attempt + 1)
         }
+    }
+
+    private func startStallMonitor() {
+        stallTimer?.invalidate()
+        stallTimer = Timer.scheduledTimer(withTimeInterval: Self.stallCheckInterval, repeats: true) { [weak self] _ in
+            self?.checkForStall()
+        }
+    }
+
+    /// The input engine can deliver one buffer and then silently stop (e.g. the
+    /// Bluetooth device reconfigures). Detect stalls in the middle of a
+    /// recording, not just at start, and recreate the engine.
+    private func checkForStall() {
+        stateLock.lock()
+        let active = isRecording
+        let count = tapFireCount
+        let token = captureToken
+        stateLock.unlock()
+        guard active else { return }
+
+        if count != lastObservedTapCount {
+            lastObservedTapCount = count
+            lastTapChange = Date()
+            return
+        }
+
+        let elapsed = Date().timeIntervalSince(lastTapChange)
+        let timeout = count == 0 ? Self.firstTapTimeout : Self.stallTimeout
+        guard elapsed > timeout else { return }
+
+        report("[AudioRecorder] input stalled for \(String(format: "%.1f", elapsed))s (callbacks=\(count)); restarting capture")
+        lastTapChange = Date() // avoid triggering again while the retry runs
+        scheduleRetry(token: token, attempt: currentAttempt, reason: "tap stalled")
     }
 
     private func teardownEngine() {
@@ -296,6 +332,8 @@ final class AudioRecorder {
     }
 
     deinit {
+        stallTimer?.invalidate()
+        stallTimer = nil
         stateLock.lock()
         isRecording = false
         captureToken &+= 1

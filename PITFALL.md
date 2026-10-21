@@ -419,3 +419,25 @@ output 节点。
 断言 `nowPlayingInfo/playbackState`。停止录音后才重建 A2DP output engine。
 代价：录音期间媒体键是否能路由到 App 需要实测；若不行，只能靠 UI 停止按钮 / 独立麦克风 /
 厂商手势设置。
+
+**再补充：输入引擎可能"只回调一次就静默停止"**
+
+第二轮日志：
+
+```
+attempt 1/3 input=16 kHz ... engine started ... TAP: first callback
+（之后没有 VAD / 没有任何日志，界面卡在 listening）
+```
+
+也就是说设备在 A2DP→HFP 的过渡中让引擎只交付了一个 buffer 就停了。旧 watchdog 只检查
+"0 个回调"，`tapFireCount == 1` 就认为成功，因此永远不会重试。
+
+现在 `AudioRecorder` 有 0.5s 周期的 stall watchdog：
+
+* 0 回调超过 1.0s → 重试；
+* 有回调但超过 1.2s 没有**新的**回调 → 判定输入已停，teardown、0.5s 后用**新
+  `AVAudioEngine`** 重试（最多 3 次）；
+* 全部失败 → `onCaptureFailed`，界面报错并停止。
+
+这能覆盖"启动成功但中途静默死掉"的情况；日志会显示
+`input stalled for X.Xs (callbacks=N); restarting capture` 以及后续 attempt 结果。
