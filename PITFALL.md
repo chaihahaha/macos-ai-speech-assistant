@@ -552,3 +552,14 @@ HFP 里做麦克风），App 继续是 Now Playing，输入仍从耳机采；AI 
 
 **提示音**：capture 失败/重试时用 `NSSound("Basso")`，软重试进入 listening 时用
 `NSSound("Glass")`，让用户知道需要重说；提示音在恢复耳机输出之后播放。
+
+**扬声器 keep-alive 方案失败（保持 Now Playing 但三击仍无事件，且 TTS 变噪音）**
+
+实测日志：录音期间 `output -> built-in speakers` / `silent keep-alive on speakers` 已生效，
+App 确实是 Now Playing，但整段仍然**没有任何 `[MediaKeys]` 事件**。结论：耳机在 HFP 通话
+模式下固件根本不发送 AVRCP 的 nextTrack/previousTrack。保持 Now Playing 也无法收到"根本没
+发出来的键"。
+
+同时，录音结束后从扬声器切回耳机 A2DP 的路由状态会让 TTS 变成噪音。该方案已回退：
+录音前仍 `pauseKeepAliveForRecording()`（停输出引擎），录音后 pin 耳机 + 重建 A2DP。
+TTS 只恢复了可听；三击在录音期间作为退出手段不可行，只能用界面按钮。

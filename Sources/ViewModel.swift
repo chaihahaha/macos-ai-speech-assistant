@@ -378,6 +378,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         // moment to settle. Starting the recorder in the same run-loop turn can
         // make AVAudioEngine.start() hang or deliver zero input callbacks
         // (the device is mid A2DP<->HFP switch). ~0.6s is enough in practice.
+        mediaKeys.pauseKeepAliveForRecording()
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 600_000_000)
             guard let self, self.isCurrent(gen), self.conversationState == .listening else {
@@ -391,10 +392,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                 self.stopConversation(caller: "headsetNotReady")
                 return
             }
-            // Keep Now Playing alive on the built-in speakers so AVRCP media
-            // keys (right-ear triple) still reach us while the headset mic is
-            // in HFP. The AI voice is NOT routed here.
-            self.mediaKeys.startRecordingKeepAliveOnSpeakers()
             self.recorder?.startRecording()
             if self.recorder?.isRecording != true {
                 self.mediaKeys.resumeKeepAliveAfterRecording()
@@ -520,7 +517,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @discardableResult
     private func stopRecordingAndResumeKeepAlive() -> [Float] {
         let samples = recorder?.stopRecording() ?? []
-        mediaKeys.stopRecordingKeepAliveAndRestoreOutput()
         _ = headset.pinDefaults()
         mediaKeys.resumeKeepAliveAfterRecording()
         return samples
