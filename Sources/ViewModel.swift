@@ -378,7 +378,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         // moment to settle. Starting the recorder in the same run-loop turn can
         // make AVAudioEngine.start() hang or deliver zero input callbacks
         // (the device is mid A2DP<->HFP switch). ~0.6s is enough in practice.
-        mediaKeys.pauseKeepAliveForRecording()
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 600_000_000)
             guard let self, self.isCurrent(gen), self.conversationState == .listening else {
@@ -388,9 +387,14 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             guard ready, self.isCurrent(gen), self.conversationState == .listening else {
                 self.logConversation("[\(self.timestamp())] HEADSET: not ready for recording")
                 self.errorMessage = "Bluetooth headset not connected. Reconnect it and try again."
+                SoundFeedback.warning()
                 self.stopConversation(caller: "headsetNotReady")
                 return
             }
+            // Keep Now Playing alive on the built-in speakers so AVRCP media
+            // keys (right-ear triple) still reach us while the headset mic is
+            // in HFP. The AI voice is NOT routed here.
+            self.mediaKeys.startRecordingKeepAliveOnSpeakers()
             self.recorder?.startRecording()
             if self.recorder?.isRecording != true {
                 self.mediaKeys.resumeKeepAliveAfterRecording()
@@ -516,6 +520,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @discardableResult
     private func stopRecordingAndResumeKeepAlive() -> [Float] {
         let samples = recorder?.stopRecording() ?? []
+        mediaKeys.stopRecordingKeepAliveAndRestoreOutput()
         _ = headset.pinDefaults()
         mediaKeys.resumeKeepAliveAfterRecording()
         return samples
@@ -695,8 +700,11 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                     guard let self, !self.captureRecoveryInProgress else { return }
                     self.captureRecoveryAttempts += 1
                     self.logConversation("[\(self.timestamp())] HEADSET: capture failed, recovery attempt \(self.captureRecoveryAttempts)")
-                    self.errorMessage = "Microphone capture failed; reconnecting the Bluetooth headset…"
+                    self.errorMessage = "麦克风暂时不可用，正在重试…"
                     self.stopConversation(caller: "captureFailed")
+                    // Play after stopConversation restored the headset output,
+                    // otherwise the cue goes to the speakers and is inaudible.
+                    SoundFeedback.warning()
                     guard self.captureRecoveryAttempts <= 2 else {
                         self.errorMessage = "Bluetooth headset not connected. Reconnect it and try again."
                         return
@@ -711,6 +719,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                     self.captureRecoveryInProgress = false
                     self.errorMessage = nil
                     self.logConversation("[\(self.timestamp())] HEADSET: soft retry after capture failure")
+                    SoundFeedback.ready()
                     self.startListening()
                 }
             }

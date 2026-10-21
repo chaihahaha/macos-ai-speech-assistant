@@ -3,6 +3,7 @@ import AppKit
 import ApplicationServices
 import MediaPlayer
 import AVFoundation
+import CoreAudio
 
 /// Receives the hardware media keys (play/pause, next, previous) and forwards
 /// them to the app as simple, *deduplicated* callbacks.
@@ -70,6 +71,10 @@ final class MediaKeyController {
     /// True while AVSpeechSynthesizer owns the output route. The silent engine
     /// must stay off so TTS starts cleanly and the route is free afterwards.
     private var speechActive = false
+    /// Output device we displaced while keeping Now Playing on the built-in
+    /// speakers during recording.
+    private var savedOutputDevice: AudioDeviceID?
+    private var speakerKeepAliveActive = false
 
     init() {
         setupRemoteCommands()
@@ -287,6 +292,115 @@ final class MediaKeyController {
         startSilentPlayback()
         setPlaying()
         log("[MediaKeys] keep-alive resumed after recording")
+    }
+
+    /// During recording we still need to be the system "Now Playing" app, or
+    /// AVRCP media keys (e.g. the right-ear triple) never reach us. Keep a
+    /// silent engine on the built-in speakers (NOT on the headset, which is busy
+    /// with the HFP microphone) so media keys keep working while the input is
+    /// captured from the headset.
+    func startRecordingKeepAliveOnSpeakers() {
+        guard !speakerKeepAliveActive else { return }
+        recordingActive = true
+        guard let speakers = Self.builtInOutputDevice() else {
+            stopSilentPlayback()
+            log("[MediaKeys] no built-in speakers for recording keep-alive")
+            return
+        }
+        let current = Self.defaultOutputDevice()
+        if current != speakers {
+            savedOutputDevice = current
+            _ = Self.setDefaultOutputDevice(speakers)
+            log("[MediaKeys] output -> built-in speakers for recording")
+        }
+        stopSilentPlayback()
+        startSilentPlayback()
+        speakerKeepAliveActive = true
+        log("[MediaKeys] silent keep-alive on speakers during recording")
+    }
+
+    /// Stop the speaker keep-alive and put the previous output device back.
+    func stopRecordingKeepAliveAndRestoreOutput() {
+        if speakerKeepAliveActive {
+            speakerKeepAliveActive = false
+            stopSilentPlayback()
+            if let saved = savedOutputDevice {
+                _ = Self.setDefaultOutputDevice(saved)
+                log("[MediaKeys] output restored after recording")
+            }
+            savedOutputDevice = nil
+        }
+        recordingActive = false
+    }
+
+    // MARK: - CoreAudio device helpers
+
+    private static func allOutputDevices() -> [AudioDeviceID] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size) == noErr else { return [] }
+        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &ids) == noErr else { return [] }
+        return ids
+    }
+
+    private static func hasOutputChannels(_ device: AudioDeviceID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(device, &address, 0, nil, &size) == noErr, size > 0 else { return false }
+        let raw = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { raw.deallocate() }
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, raw) == noErr else { return false }
+        let list = UnsafeMutableAudioBufferListPointer(raw.assumingMemoryBound(to: AudioBufferList.self))
+        return list.reduce(0) { $0 + Int($1.mNumberChannels) } > 0
+    }
+
+    private static func transportType(_ device: AudioDeviceID) -> UInt32 {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(device, &address, 0, nil, &size, &value)
+        return status == noErr ? value : 0
+    }
+
+    private static func builtInOutputDevice() -> AudioDeviceID? {
+        allOutputDevices().first { transportType($0) == kAudioDeviceTransportTypeBuiltIn && hasOutputChannels($0) }
+    }
+
+    private static func defaultOutputDevice() -> AudioDeviceID {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var device = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device)
+        return device
+    }
+
+    @discardableResult
+    private static func setDefaultOutputDevice(_ device: AudioDeviceID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var id = device
+        let size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        return AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, size, &id) == noErr
     }
 
     func startSilentPlayback() {

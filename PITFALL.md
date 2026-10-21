@@ -533,3 +533,22 @@ TTS 也被送到 Mac 扬声器（耳机里听不到）。耳机不在默认输�
 * `reconnect()`（close/open）保留但不再自动调用；需要时由用户手动触发/重启 App。
 * 耳机自身在 A2DP↔HFP 之间的切换提示音是固件/蓝牙协议行为，App/驱动无法消除；
   要完全避免只能在硬件上让耳机只承担一种角色（USB/2.4G 接收器，或独立麦克风/扬声器）。
+
+---
+
+## 17. 录音时不是 Now Playing → AVRCP 三击到不了 App
+
+日志里整段只有启动时的 `(MPRemote) playPause fired`，录音期间的右耳三击没有任何
+`nextTrack`/`previousTrack` 事件。原因是 `pauseKeepAliveForRecording()` 把静音 keep-alive
+停了：没有音频在播放，macOS 不再把 App 当作 Now Playing，蓝牙 AVRCP 媒体键就不会路由过来
+（HFP 下耳机按钮还可能被固件当成语音助手）。
+
+**修复（待实测）**：录音期间把静音 keep-alive 放到 **Mac 内置扬声器**上（不是耳机，耳机在
+HFP 里做麦克风），App 继续是 Now Playing，输入仍从耳机采；AI 声音不走扬声器（只是静音）。
+停止录音时停掉扬声器 keep-alive、恢复原输出设备，再重建耳机 A2DP keep-alive。
+`MediaKeyController.startRecordingKeepAliveOnSpeakers()` /
+`stopRecordingKeepAliveAndRestoreOutput()`。若录音中三击仍无事件，说明耳机固件在 HFP 下
+根本不发 AVRCP，只能改用界面按钮退出。
+
+**提示音**：capture 失败/重试时用 `NSSound("Basso")`，软重试进入 listening 时用
+`NSSound("Glass")`，让用户知道需要重说；提示音在恢复耳机输出之后播放。

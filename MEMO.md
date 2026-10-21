@@ -114,6 +114,9 @@
 * **不要自动 close/open 蓝牙**：只在链路真断开时 `openConnection`；音频设备暂时缺失只等待。
   `pinDefaults` 仅在默认设备不同时 set。capture 失败做软重试（等待+重 pin+重试一次），
   不再拆连接，避免"反复断开重连"的提示音和更糟的设备状态。
+* **录音时的 Now Playing**：录音期间静音 keep-alive 放在内置扬声器（不是耳机），保持 App 为
+  Now Playing，让 AVRCP 三击能到达；输入仍从耳机。停止后恢复耳机输出。
+* **失败提示音**：capture 失败播 Basso、软重试进入 listening 播 Glass，避免用户干等。
 * **驱动不可行**：macOS kext 已废弃/需关 SIP，DriverKit 不提供通用蓝牙音频/HFP 驱动；
   蓝牙音频由闭源 bluetoothd + coreaudiod 管理。HAL 虚拟声卡仍走同一蓝牙栈，无法绕过
   A2DP↔HFP 切换。要彻底消除切换只能换硬件形态（USB/2.4G 耳机或独立 mic/扬声器）。
