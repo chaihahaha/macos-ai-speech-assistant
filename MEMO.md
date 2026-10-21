@@ -120,6 +120,10 @@
 * **录音时的三击不可行**：实测即使把静音 keep-alive 放内置扬声器、App 保持 Now Playing，
   录音（HFP）期间也收不到任何 AVRCP 事件 → 耳机固件在 HFP 下不发媒体键。该方案已回退
   （还会让 TTS 路由变噪音）。录音中退出只能用界面按钮。
+* **VPIO 已回退**：`setVoiceProcessingEnabled(true)` 会把麦克风电平压到 0.000x，导致只识别
+  一半/幻觉；不要再用。判断静音用整段 RMS（<0.003）而不是 peak。
+* **等待期间继续采集**：VAD end 不再立刻 finishCapture；`onSpeechStarted` 取消发送并继续
+  收集，避免一句话只识别前半段。
 * **HFP 16k 全 0**：input-only engine 可能不激活 SCO；在 beginCapture 里先
   `inputNode.setVoiceProcessingEnabled(true)`（VPIO 通话路径）。日志确认
   `voice processing enabled`；若仍全 0，下一步加 16k 静音 player 做 duplex。

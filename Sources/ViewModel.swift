@@ -366,12 +366,13 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                 guard self.conversationState == .listening || self.conversationState == .waitingSilence else { return }
                 print("[VM] maxRecordingDuration reached")
                 let audio = self.finishCaptureKeepingHFP()
-                var peak: Float = 0
-                for sample in audio { peak = max(peak, abs(sample)) }
-                if peak < 0.003 {
+                var sum: Double = 0
+                for sample in audio { sum += Double(sample) * Double(sample) }
+                let rms = audio.isEmpty ? 0 : sqrt(sum / Double(audio.count))
+                if rms < 0.002 {
                     // Long silence: go straight back to idle instead of sending
                     // an empty clip through ASR/LLM.
-                    self.logConversation("[\(self.timestamp())] TIMEOUT: no speech, returning to idle")
+                    self.logConversation("[\(self.timestamp())] TIMEOUT: no speech (rms=\(String(format: "%.4f", rms))), returning to idle")
                     SoundFeedback.timeout()
                     self.stopConversation(caller: "recordingTimeoutSilence")
                     return
@@ -386,6 +387,19 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             Task { @MainActor [weak self] in
                 guard let self, self.isCurrent(gen) else { return }
                 self.onSpeechEnded(generation: gen)
+            }
+        }
+
+        recorder?.onSpeechStarted = { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.conversationState == .waitingSilence else { return }
+                // The user kept talking: cancel the send and keep collecting.
+                self.pendingSendTask?.cancel()
+                self.pendingSendTask = nil
+                self.beepTimer?.invalidate()
+                self.beepTimer = nil
+                self.conversationState = .listening
+                self.logConversation("[\(self.timestamp())] SPEECH: resumed during wait, keep collecting")
             }
         }
 
@@ -870,20 +884,9 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         print("[VM] onSpeechEnded, state=\(conversationState.rawValue)")
 
         conversationState = .waitingSilence
-        pendingAudio = finishCaptureKeepingHFP()
-
-        // Guard against VAD false positives / ASR hallucinations on silence:
-        // if the captured clip has no real energy, go idle instead of sending
-        // an empty clip (Qwen ASR tends to invent English sentences on silence).
-        var capturedPeak: Float = 0
-        for sample in pendingAudio { capturedPeak = max(capturedPeak, abs(sample)) }
-        if capturedPeak < 0.005 {
-            self.logConversation("[\(self.timestamp())] SPEECH: false end (peak=\(String(format: "%.4f", capturedPeak))), idle")
-            SoundFeedback.timeout()
-            stopConversation(caller: "falseSpeechSilence")
-            return
-        }
-
+        // IMPORTANT: keep collecting during the silence wait. The VAD may end a
+        // segment on a short pause; stopping the recorder here discarded the
+        // rest of the sentence (ASR only got the first half).
         SoundFeedback.waiting()
         silenceTimerValue = appConfig.vad.silenceTimeout
         maxRecordingTimer?.invalidate()
@@ -891,6 +894,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         beepTimer?.invalidate()
         beepCount = 0
+        // Silent countdown for the UI; only one waiting beep is played.
         beepTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.isCurrent(gen) else { return }
@@ -916,8 +920,27 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             guard let self, !Task.isCancelled, self.isCurrent(gen) else { return }
             guard self.conversationState == .waitingSilence else { return }
             self.pendingSendTask = nil
-            self.launchPipeline(generation: gen)
+            self.finishAndSend(generation: gen)
         }
+    }
+
+    /// Finish the (still running) capture, reject pure noise/silence, then send.
+    private func finishAndSend(generation gen: UInt64) {
+        guard isCurrent(gen), conversationState == .waitingSilence else { return }
+        let audio = finishCaptureKeepingHFP()
+        var sum: Double = 0
+        for sample in audio { sum += Double(sample) * Double(sample) }
+        let rms = audio.isEmpty ? 0 : sqrt(sum / Double(audio.count))
+        if rms < 0.003 {
+            logConversation("[\(timestamp())] SPEECH: no real speech (rms=\(String(format: "%.4f", rms))), idle")
+            SoundFeedback.timeout()
+            stopConversation(caller: "silenceAfterWait")
+            return
+        }
+        pendingAudio = audio
+        beepTimer?.invalidate()
+        beepTimer = nil
+        launchPipeline(generation: gen)
     }
 
     private func launchPipeline(generation gen: UInt64) {
@@ -975,8 +998,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             logConversation("[\(timestamp())] PIPELINE: stale ASR result dropped")
             return
         }
-
-        _ = finishCaptureKeepingHFP()
 
         let trimmed = asrText.trimmingCharacters(in: .whitespacesAndNewlines)
         print("[VM] ASR result: '\(trimmed)' len=\(trimmed.count)")

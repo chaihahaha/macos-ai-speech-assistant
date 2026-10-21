@@ -22,6 +22,9 @@ final class AudioRecorder {
     var isEngineRunning: Bool { engine.isRunning && tapInstalled }
 
     var onSpeechEnded: (() -> Void)?
+    /// Called when the VAD detects speech again (used to cancel the silence
+    /// countdown while the user is still talking).
+    var onSpeechStarted: (() -> Void)?
     /// Called once when the first audio buffer arrives (capture is really alive).
     /// The ViewModel uses this to start the silent Now-Playing engine *after*
     /// the input engine, which avoids the output-first starvation.
@@ -226,15 +229,6 @@ final class AudioRecorder {
         stateLock.unlock()
         lastTapChange = Date()
         let inputNode = engine.inputNode
-        // Open the voice-processing path (the same "call" path used by video
-        // chat apps). Without it the headset can expose a 16 kHz HFP input
-        // endpoint that delivers pure zeros: the SCO link is never activated.
-        do {
-            try inputNode.setVoiceProcessingEnabled(true)
-            report("[AudioRecorder] voice processing enabled")
-        } catch {
-            report("[AudioRecorder] voice processing enable failed: \(error)")
-        }
         let inputFormat = inputNode.inputFormat(forBus: 0)
         report("[AudioRecorder] attempt \(attempt)/\(Self.maxCaptureAttempts) input=\(inputFormat) defaultInput=\(defaultInputInfo())")
 
@@ -431,6 +425,9 @@ final class AudioRecorder {
             case .speechStarted(let time):
                 report("[VAD] Speech started at \(String(format: "%.2f", time))s")
                 self.speechActive = true
+                DispatchQueue.main.async { [weak self] in
+                    self?.onSpeechStarted?()
+                }
             case .speechEnded(let segment):
                 report("[VAD] Speech ended at \(String(format: "%.2f", segment.endTime))s (duration: \(String(format: "%.2f", segment.duration))s)")
                 self.speechActive = false

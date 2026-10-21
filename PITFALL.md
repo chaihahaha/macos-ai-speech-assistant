@@ -641,3 +641,21 @@ try inputNode.setVoiceProcessingEnabled(true)
 这会启用 Apple 的 voice-processing IO（AEC/通话路径），让 HFP SCO 真正建立。
 日志会打印 `[AudioRecorder] voice processing enabled`；若抛错会打印失败原因。
 如果仍全 0，下一步是给 engine 接一个 16 kHz 的静音 player（duplex，模拟通话的双向流）。
+
+---
+
+## 20. VPIO 把麦克风电平压到接近 0；静音门限太低导致幻觉
+
+启用 `setVoiceProcessingEnabled(true)` 后，日志里即使说话 `periodPeak` 也只有
+0.0003–0.005（正常语音约 0.07），ASR 只能识别出"你好。"，60 秒静音 clip 的峰值恰好到
+0.005，越过了 `peak < 0.005` 的门限，被送进 ASR → 幻觉出
+`The heartbeat of the city.`。VPIO 已回退。
+
+同时修了两个真 bug：
+
+* **只识别一半**：VAD `onSpeechEnded` 时立刻 `finishCapture()`，之后 5 秒等待期间的
+  语音全部丢弃。现在 waiting 期间**继续采集**；`onSpeechStarted` 时取消发送、继续收集，
+  最终送 ASR 的是完整句子。
+* **静音门限**：从 peak 0.005 改为整段 **RMS < 0.003** 判定无语音；60 秒噪声 clip 的
+  RMS 远低于此，不会再进 ASR。
+* 录音超时路径同样用 RMS < 0.002 直接回 idle。
