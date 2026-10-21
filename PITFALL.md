@@ -346,3 +346,28 @@ otool -s __TEXT __info_plist .build/debug/MyLlamaSpeechAssistant   # 必须能�
 
 **排查口诀**：日志里 `input format` 的采样率不是 16000、或 `defaultInput` 不是耳机 →
 输入端点选错了；看 `attempt 1/3 ... attempt 2/3 ...` 是否重试成功。
+
+---
+
+## 13. HFP 录音时耳机双击被固件映射成"语音助手"（Siri），App 收不到
+
+**现象**
+
+* Idle（A2DP）双击右耳：App 收到 `[MediaKeys] (MPRemote) playPause fired`，正常开始录音。
+* 录音中（HFP，麦克风打开）双击右耳：直接唤起 Siri，App 日志**没有任何 `[MediaKeys]` 事件**。
+
+**原因**
+
+双击在 A2DP 音乐模式下是普通媒体键（AVRCP play/pause）；一旦进入 HFP 通话模式，耳机固件
+把同一手势重新映射为 HFP 语音助手（AT+BVRA），macOS 直接交给 Siri。这个事件不走
+`MPRemoteCommandCenter`，App 无法拦截，也无法"用同样方法"收到。
+
+**处置**
+
+* 已把"退出到 Idle"改为**右耳三击**（`nextTrack`，HFP 下通常仍是媒体命令），双击只负责开始。
+  * 录音/等静默/识别中 → 丢弃音频或识别结果，直接 Idle。
+  * 生成中 → 停止朗读，但等 LLM 生成完、把完整文本写入历史后再 Idle（不丢文本）。
+  * 生成完成、朗读中 → 停止朗读，保留文本，Idle。
+* TTS 语速固定为 `tts.fastRate`（高速），不再占用三击。
+* 如果三击在 HFP 下也被 Siri 抢走，则只能：用界面停止按钮、在厂商 App 改通话模式手势、
+  或换独立麦克风让耳机保持 A2DP。

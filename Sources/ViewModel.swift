@@ -65,9 +65,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private var ttsRate: Float
 
     private let speechSynthesizer = AVSpeechSynthesizer()
-    /// Separate synthesizer used only for the short "快 / 慢" speed confirmation,
-    /// so it never disturbs the conversation TTS bookkeeping.
-    private let speedAnnouncer = AVSpeechSynthesizer()
     private var pendingSentence: String = ""
     private var hasStartedSpeaking = false
     /// Sentences waiting to be spoken. They are handed to
@@ -76,6 +73,9 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private var ttsQueue: [String] = []
     private var currentlySpeakingText: String?
     private var streamingComplete = false
+    /// Triple press while the LLM is still streaming: stop speaking now, but let
+    /// the generation finish so its text is preserved, then go idle.
+    private var gracefulExitPending = false
     /// Maps each utterance to the generation that queued it, so completions
     /// coming from a stopped/interrupted cycle can be ignored.
     private var utteranceGenerations: [ObjectIdentifier: UInt64] = [:]
@@ -112,7 +112,9 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
     override init() {
         appConfig = AppConfig.load()
-        ttsRate = appConfig.tts.rate
+        // Triple press is now the "exit" gesture, so the TTS rate is fixed at
+        // the fast setting (config.json -> tts.fastRate).
+        ttsRate = appConfig.tts.fastRate > 0 ? appConfig.tts.fastRate : 1.3
         ttsRateLabel = String(format: "%.2fx", ttsRate)
 
         selectedBackend = appConfig.backend
@@ -136,6 +138,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         mediaKeys.logHandler = { [weak self] message in
             self?.logConversation(message)
         }
+        mediaKeys.logDiagnostics()
         mediaKeys.setHandlers(
             // EDIFIER X Fit: a double press on either earbud is the only
             // gesture that maps to play/pause (single presses send nothing at
@@ -206,55 +209,50 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         }
     }
 
-    /// Right-ear triple press.
-    /// - Idle: undo the last exchange (the user wants to rephrase and retry).
-    /// - Any active turn: toggle the TTS speaking rate.
+    /// Right-ear triple press = "exit to idle".
+    /// * Idle: undo the last exchange.
+    /// * Recording / waiting for silence: discard the audio, idle.
+    /// * Transcribing: discard the pending recognition, idle.
+    /// * Generating (or TTS started before the LLM finished): stop TTS, let the
+    ///   LLM finish, keep the assistant text, then idle.
+    /// * Speaking after generation finished: stop TTS, keep the text, idle.
     private func handleTriplePress() {
-        print("[MediaKey] handleTriplePress, state=\(conversationState.rawValue)")
-        if conversationState == .inactive {
+        print("[MediaKey] handleTriplePress, state=\(conversationState.rawValue) streamingComplete=\(streamingComplete)")
+        switch conversationState {
+        case .inactive:
             undoLastConversation()
-        } else {
-            toggleTTSSpeed()
+        case .listening, .waitingSilence:
+            stopConversation(caller: "triple")
+            debugInfo = "Discarded this recording (idle)."
+            logConversation("[\(timestamp())] TRIPLE: discarded recording, idle")
+        case .transcribing:
+            interruptConversation()
+            debugInfo = "Discarded this recording (idle)."
+            logConversation("[\(timestamp())] TRIPLE: discarded recognition, idle")
+        case .generating, .speaking:
+            if streamingComplete {
+                // Generation finished and the assistant text is already saved.
+                stopSynthesis()
+                enterIdle(noAutoResume: true, debugInfo: "Done (idle). Triple again to undo.")
+                logConversation("[\(timestamp())] TRIPLE: stopped TTS, idle")
+            } else {
+                gracefulExitAfterGeneration()
+            }
         }
     }
 
-    private func toggleTTSSpeed() {
-        print("[MediaKey] toggleTTSSpeed, before=\(ttsRate) state=\(conversationState.rawValue)")
-        if ttsRate <= appConfig.tts.slowRate + 0.05 {
-            ttsRate = 1.5
-            debugInfo = "TTS: fast (1.5x)"
-        } else {
-            ttsRate = appConfig.tts.slowRate
-            debugInfo = "TTS: slow (\(String(format: "%.1f", ttsRate))x)"
+    /// Stop speaking immediately, but let the in-flight generation finish so the
+    /// assistant text is preserved. `onComplete` appends it and goes idle.
+    private func gracefulExitAfterGeneration() {
+        guard !gracefulExitPending else { return }
+        gracefulExitPending = true
+        stopSynthesis()
+        if conversationState == .speaking {
+            conversationState = .generating
+            logStateChange(.generating)
         }
-        ttsRateLabel = String(format: "%.2fx", ttsRate)
-        print("[MediaKey] TTS rate: \(ttsRate)")
-
-        if let current = currentlySpeakingText {
-            // Restart the sentence that is playing so the change is audible
-            // immediately. The rest of the queue is preserved and will also be
-            // spoken at the new rate.
-            utteranceGenerations.removeAll()
-            currentlySpeakingText = nil
-            speechSynthesizer.stopSpeaking(at: .immediate)
-            ttsQueue.insert(current, at: 0)
-            drainTTSQueue()
-        } else {
-            // Nothing to restart — announce so a triple-click while idle is
-            // not silent.
-            announceTTSSpeed()
-        }
-    }
-
-    private func announceTTSSpeed() {
-        let text = ttsRate >= 1.0 ? "快" : "慢"
-        let utterance = AVSpeechUtterance(string: text)
-        utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
-            ?? AVSpeechSynthesisVoice(language: "en-US")
-        utterance.rate = AVSpeechUtteranceDefaultSpeechRate * ttsRate
-        utterance.volume = 1.0
-        speedAnnouncer.stopSpeaking(at: .immediate)
-        speedAnnouncer.speak(utterance)
+        debugInfo = "Finishing generation, then idle…"
+        logConversation("[\(timestamp())] TRIPLE: graceful exit (waiting for generation to finish)")
     }
 
     // MARK: - State transitions
@@ -337,7 +335,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         ttsQueue.removeAll()
         currentlySpeakingText = nil
         utteranceGenerations.removeAll()
-        speedAnnouncer.stopSpeaking(at: .immediate)
+        gracefulExitPending = false
         pendingAudio = []
         currentTurnUserMessageID = nil
 
@@ -390,6 +388,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         pendingAudio = []
         opencodeResponseText = ""
         currentTurnUserMessageID = nil
+        gracefulExitPending = false
         llamaCppClient?.cancel()
         opencodeClient?.cancelPending()
         Task { await opencodeClient?.interrupt() }
@@ -423,6 +422,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         stopSynthesis()
         isTyping = false
+        gracefulExitPending = false
         llamaCppClient?.cancel()
         opencodeClient?.cancelPending()
         Task { await opencodeClient?.interrupt() }
@@ -475,7 +475,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         currentlySpeakingText = nil
         ttsQueue.removeAll()
         speechSynthesizer.stopSpeaking(at: .immediate)
-        speedAnnouncer.stopSpeaking(at: .immediate)
         hasStartedSpeaking = false
         pendingSentence = ""
         streamingComplete = false
@@ -510,23 +509,27 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         }
     }
 
-    /// The exchange is complete. Mark the cycle as inactive and **stay there**:
-    /// the user starts the next recording manually (double press). This also
-    /// makes "triple press while idle = undo last turn" reachable after a normal
-    /// answer.
-    /// A turn finished **normally**: go idle briefly and automatically resume
-    /// listening for the next turn. Interrupts/undo deliberately do NOT use this
-    /// path — they stay idle until the user starts the next recording manually.
-    private func finishTurn() {
-        guard conversationState != .inactive else { return }
-        print("[VM] cycle complete, resuming listening (state was \(conversationState.rawValue))")
+    private func enterIdle(noAutoResume: Bool, debugInfo text: String) {
         conversationState = .inactive
         logStateChange(.inactive)
         isTyping = false
         currentTurnUserMessageID = nil
-        debugInfo = "Done. Listening again…"
+        debugInfo = text
         mediaKeys.setPlaying()
-        scheduleStartListening(after: 1.5, reason: "turnFinished")
+        if noAutoResume {
+            restartTask?.cancel()
+            restartTask = nil
+        } else {
+            scheduleStartListening(after: 1.5, reason: "turnFinished")
+        }
+    }
+
+    /// A turn finished **normally**: go idle briefly and automatically resume
+    /// listening for the next turn. Interrupts/undo/triple do NOT use this path.
+    private func finishTurn() {
+        guard conversationState != .inactive else { return }
+        print("[VM] cycle complete, resuming listening (state was \(conversationState.rawValue))")
+        enterIdle(noAutoResume: false, debugInfo: "Done. Listening again…")
     }
 
     // MARK: - Logging
@@ -920,6 +923,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         hasStartedSpeaking = false
         pendingSentence = ""
         streamingComplete = false
+        gracefulExitPending = false
         ttsQueue.removeAll()
         currentlySpeakingText = nil
         utteranceGenerations.removeAll()
@@ -974,6 +978,14 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                     } else {
                         self.errorMessage = "llama.cpp returned no text. Check \(self.llamacppURL) and the server log."
                         self.logConversation("[\(self.timestamp())] ERROR: llama.cpp returned no text")
+                    }
+
+                    if self.gracefulExitPending {
+                        self.gracefulExitPending = false
+                        self.pendingSentence = ""
+                        self.enterIdle(noAutoResume: true, debugInfo: "Done (idle). Triple again to undo.")
+                        self.logConversation("[\(self.timestamp())] TRIPLE: generation finished, idle")
+                        return
                     }
 
                     if !self.pendingSentence.isEmpty {
@@ -1048,6 +1060,14 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                         self.logConversation("[\(self.timestamp())] ERROR: opencode returned no text")
                     }
 
+                    if self.gracefulExitPending {
+                        self.gracefulExitPending = false
+                        self.pendingSentence = ""
+                        self.enterIdle(noAutoResume: true, debugInfo: "Done (idle). Triple again to undo.")
+                        self.logConversation("[\(self.timestamp())] TRIPLE: generation finished, idle")
+                        return
+                    }
+
                     if !self.pendingSentence.isEmpty {
                         self.speakSentence(self.pendingSentence)
                         self.pendingSentence = ""
@@ -1064,6 +1084,9 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     private func streamTTSToken(_ token: String) {
+        // Triple press asked us to finish generation silently.
+        guard !gracefulExitPending else { return }
+
         pendingSentence += token
 
         let sentenceEnders = CharacterSet(charactersIn: ".!?。！？\n")
@@ -1097,8 +1120,8 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     /// Feeds exactly one sentence to `AVSpeechSynthesizer` at a time. Keeping
-    /// the queue ourselves lets `toggleTTSSpeed()` restart the current sentence
-    /// at the new rate without losing the remaining sentences.
+    /// the queue ourselves lets us stop cleanly and keeps the remaining
+    /// sentences intact.
     private func drainTTSQueue() {
         guard currentlySpeakingText == nil, !ttsQueue.isEmpty else { return }
         let text = ttsQueue.removeFirst()

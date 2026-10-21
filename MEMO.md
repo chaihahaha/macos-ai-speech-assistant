@@ -49,19 +49,23 @@
   `play/pause` 来自**双击**（左右耳双击都发 `play/pause`，无法区分左右）。
   上一轮 24 个手势共 12 条事件的正确分解是：8 个双击 → 8 条 play/pause，
   4 个右耳三击 → 4 条 nextTrack，8 个单击 + 4 个左耳三击 → 0 条。
-* 因此：**这只耳机的可用手势是"双击"（主操作/会话开关）和"右耳三击"（`nextTrack`）**。
+* 因此：**这只耳机的可用手势是"双击"（开始录音）和"右耳三击"（退出到 Idle）**。
   单击永远不会有反应，不是 App 的 bug。
-* 右耳三击是**上下文相关**的（`handleTriplePress`）：
+* **右耳三击 = 退出到 Idle**（`handleTriplePress`）：
   * **Idle**：撤销上一轮对话（删除最后一条 user 消息及其后的 assistant 回复，并清掉 opencode
     会话，确保模型上下文里也不再包含被撤销的那轮）；仍停在 Idle。
-  * **录音/识别/生成/朗读等任何进行中的状态**：切换 TTS 语速（0.5x ↔ 1.5x）。
-    为避免切速时把整段朗读弄丢/卡死，TTS 改为显式句子队列：`ttsQueue` + `currentlySpeakingText`，
-    一次只喂一句给 `AVSpeechSynthesizer`；切速时把当前句放回队首、用新语速重播，队列其余句子保留。
-    未在朗读时用独立 `speedAnnouncer` 播"快/慢"作为反馈，界面底部也会显示当前倍速。
+  * **录音 / 等静默**：丢弃这段音频，直接 Idle。
+  * **识别中**：丢弃识别结果，直接 Idle。
+  * **生成中 / 生成未结束但 TTS 已开口**：立即停止朗读，但**让 LLM 继续生成完**，把完整
+    assistant 文本写入历史后再 Idle；期间的 token 不再朗读。
+  * **生成已完成、正在朗读**：停止朗读，保留已写入历史的文本，Idle。
+* **TTS 语速固定为高速**（`config.json` 的 `tts.fastRate`，当前 1.3x），三击不再切语速。
+  句子队列（`ttsQueue` + `currentlySpeakingText`）仍保留，用于一次只喂一句给
+  `AVSpeechSynthesizer`、停止时不丢队列。
 * **完成 = 自动进入下一轮**：正常回答播放完后，`finishTurn()` 置 `.inactive`，1.5s 后自动
   `startListening()`，接着听下一轮。
-* **打断/撤销 = 停在 Idle**：双击打断、或 Idle 下右耳三击撤销后，不再自动重开录音；
-  用户用双击手动开始下一轮。
+* **打断/撤销/三击退出 = 停在 Idle**：双击硬打断、右耳三击退出、Idle 下三击撤销后，
+  都不自动重开录音；用户用双击手动开始下一轮。
 * App 必须始终是 Now Playing App，这是该耳机按键唯一的投递路径；丢掉 Now Playing 就等于
   按键全灭。旧代码里"录音引擎 = 伪装播放引擎"导致麦克风常开、蓝牙在 A2DP/HFP 间切换、
   keep-alive 引擎挂掉 —— 这是"有时候双击也没反应"的真正原因。
@@ -84,8 +88,7 @@
 * **只删本轮**：`currentTurnUserMessageID` 记录本轮 user 消息，打断时只删这一轮；
   在 `.transcribing` 阶段（user 消息还没落库）打断不会误删上一轮。
 * **TTS 句子队列**：`ttsQueue` + `currentlySpeakingText`，一次只喂一句给
-  `AVSpeechSynthesizer`。`toggleTTSSpeed()` 只把当前句放回队首并用新语速重播，保留其余队列；
-  不再像旧实现那样 stop 后重播 `pendingSentence`（会丢句子、卡在 `.speaking`）。
+  `AVSpeechSynthesizer`；停止/退出时直接清空，不会卡在 `.speaking`。语速固定为 fastRate。
 * **单 engine 原则**：录音期间只允许录音 engine 运行。开始录音前停掉 output-only 的
   Now Playing keep-alive；录音 engine 自带静音 player（attach/connect 必须在 start 之前）
   维持 Now Playing；停止录音后 stop+reset 录音 engine，再重建 keep-alive。

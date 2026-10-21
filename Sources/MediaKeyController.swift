@@ -85,6 +85,15 @@ final class MediaKeyController {
         logHandler?(message)
     }
 
+    /// Logged after the ViewModel installs `logHandler`, so it ends up in the
+    /// conversation log. Tells us whether the app (not the terminal) is allowed
+    /// to see system-defined media keys.
+    func logDiagnostics() {
+        log("[MediaKeys] diagnostics: accessibility=\(AXIsProcessTrusted()) " +
+            "cgEventTap=\(eventTap != nil) globalMonitor=\(globalEventMonitor != nil) " +
+            "localMonitor=\(localEventMonitor != nil)")
+    }
+
     // MARK: - Dispatch
 
     /// Single funnel for every trigger. Deduplicates the same action fired twice
