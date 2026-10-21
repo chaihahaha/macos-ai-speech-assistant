@@ -59,6 +59,10 @@ final class AudioRecorder {
     private var currentAttempt = 0
     private var lastObservedTapCount = 0
     private var lastTapChange = Date()
+    /// Peak since the last periodic check (guarded by sampleLock).
+    private var periodPeak: Float = 0
+    private var consecutiveZeroPeakChecks = 0
+    private var stallCheckTicks = 0
 
     init(targetSampleRate: Double = 16000, vadProcessor: StreamingVADProcessor) {
         self.targetSampleRate = targetSampleRate
@@ -92,7 +96,10 @@ final class AudioRecorder {
         sampleLock.lock()
         samples.removeAll()
         peak = 0
+        periodPeak = 0
         sampleLock.unlock()
+        consecutiveZeroPeakChecks = 0
+        stallCheckTicks = 0
 
         speechActive = false
         vadLock.lock()
@@ -230,9 +237,33 @@ final class AudioRecorder {
         stateLock.unlock()
         guard active else { return }
 
+        sampleLock.lock()
+        let observedPeak = periodPeak
+        periodPeak = 0
+        sampleLock.unlock()
+
+        stallCheckTicks += 1
+        if stallCheckTicks % 4 == 0 {
+            report("[AudioRecorder] level taps=\(count) periodPeak=\(String(format: "%.4f", observedPeak)) engineRunning=\(engine.isRunning)")
+        }
+
         if count != lastObservedTapCount {
             lastObservedTapCount = count
             lastTapChange = Date()
+            if observedPeak > 0 {
+                consecutiveZeroPeakChecks = 0
+            } else {
+                consecutiveZeroPeakChecks += 1
+            }
+            // Callbacks are flowing but the microphone is delivering pure
+            // silence: likely bound to an inactive HFP endpoint. Recreate the
+            // engine so it renegotiates the Bluetooth profile.
+            if observedPeak == 0, consecutiveZeroPeakChecks >= 4 { // ~2 s
+                consecutiveZeroPeakChecks = 0
+                report("[AudioRecorder] input is silent (peak=0) for ~2s; restarting capture")
+                lastTapChange = Date()
+                scheduleRetry(token: token, attempt: currentAttempt, reason: "silent input")
+            }
             return
         }
 
@@ -241,7 +272,7 @@ final class AudioRecorder {
         guard elapsed > timeout else { return }
 
         report("[AudioRecorder] input stalled for \(String(format: "%.1f", elapsed))s (callbacks=\(count)); restarting capture")
-        lastTapChange = Date() // avoid triggering again while the retry runs
+        lastTapChange = Date()
         scheduleRetry(token: token, attempt: currentAttempt, reason: "tap stalled")
     }
 
@@ -306,6 +337,7 @@ final class AudioRecorder {
         sampleLock.lock()
         samples.append(contentsOf: data)
         peak = max(peak, bufferPeak)
+        periodPeak = max(periodPeak, bufferPeak)
         sampleLock.unlock()
 
         DispatchQueue.main.async { [weak self] in
