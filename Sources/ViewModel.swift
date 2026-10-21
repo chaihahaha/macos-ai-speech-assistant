@@ -665,11 +665,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                     self.stopConversation(caller: "captureFailed")
                 }
             }
-            recorder.onFirstTap = { [weak self] in
-                Task { @MainActor [weak self] in
-                    self?.mediaKeys.startKeepAliveDuringRecording()
-                }
-            }
             self.recorder = recorder
 
             loadingStatus = "Ready"

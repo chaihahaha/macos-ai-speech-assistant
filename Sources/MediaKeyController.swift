@@ -253,20 +253,6 @@ final class MediaKeyController {
         log("[MediaKeys] keep-alive paused for recording")
     }
 
-    /// Called once the recorder has delivered its first buffer. Starting the
-    /// output engine only AFTER the input is live keeps the input tap alive
-    /// (the reverse order starves it) while keeping us Now Playing so media
-    /// keys still work during recording.
-    func startKeepAliveDuringRecording() {
-        recordingActive = true
-        inputCaptureActive = true
-        if silentEngine?.isRunning == true { return }
-        stopSilentPlayback()
-        startSilentPlayback()
-        setPlaying()
-        log("[MediaKeys] keep-alive started during recording (input-first)")
-    }
-
     /// Stop the recorder first, then bring the output-only A2DP keep-alive back.
     func resumeKeepAliveAfterRecording() {
         recordingActive = false

@@ -92,10 +92,11 @@
 * **录音 engine 必须 input-only**：一旦在录音 engine 上连接静音 output player，AVAudioEngine
   会把 I/O 绑到输出设备（A2DP 44.1k），`inputNode.inputFormat` 变成 44.1k，tap 永不触发
   （即使 defaultInput 是 EDIFIER 16k）。现在录音 engine 不接 output。
-* **input-first 的 Now Playing**：第一个 tap 回调到达后再启动独立的 output-only keep-alive
-  引擎（`AudioRecorder.onFirstTap` → `MediaKeyController.startKeepAliveDuringRecording()`）。
-  输出先启动会饿死输入；输入先启动再开输出则正常（probe 验证）。停止录音时先停 input，
-  再 stop+restart output（回到 A2DP，TTS 可听）。
+* **录音期间不跑 output 引擎**：实践表明在输入引擎运行后再启动 output-only
+  keep-alive 会导致不稳定（第二轮回调中断/主线程卡住）。现在录音期间只跑 input-only
+  engine；`pingNowPlaying` 仍每 0.5s 重新断言 `nowPlayingInfo/playbackState`，但不重建
+  output engine。停止录音后再 stop+restart output（回到 A2DP，TTS 可听）。
+  待验证：录音期间右耳三击是否还能到达 App；若不行，需要另想退出方式。
 * **TTS 诊断**：日志新增 `TTS-QUEUE` / `TTS-SPEAK` / `TTS-DONE`，用于确认是否有句子被丢弃
   或提前进入 Idle。
 * **capture 重试**：每次尝试用新的 `AVAudioEngine`；0.9s 没有 tap 回调就 teardown、

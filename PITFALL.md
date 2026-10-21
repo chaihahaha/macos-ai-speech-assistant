@@ -412,3 +412,10 @@ attempt 3/3 ... 44100 Hz ... capture failed
 
 **排查口诀**：`defaultInput` 对但 `input format` 是 44100 → 录音 engine 上是不是还挂着
 output 节点。
+
+**后续修正（重要）**：在输入引擎运行后再启动第二个 output-only engine 虽然 probe 看起来正常，
+但在真实 App 里会让第二轮录音在首个 tap 之后中断/卡住（日志停在 `Silent playback stopped`）。
+现在改为**录音期间只运行 input-only engine**，不再启动 output engine；`pingNowPlaying` 仍持续
+断言 `nowPlayingInfo/playbackState`。停止录音后才重建 A2DP output engine。
+代价：录音期间媒体键是否能路由到 App 需要实测；若不行，只能靠 UI 停止按钮 / 独立麦克风 /
+厂商手势设置。
