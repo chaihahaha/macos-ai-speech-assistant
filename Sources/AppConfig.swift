@@ -112,6 +112,30 @@ struct AppConfig: Codable, Sendable {
         conversationHistoryPath: NSString(string: "~/source/ai_talk_ideas").expandingTildeInPath
     )
 
+    static var userConfigPath: String {
+        NSString(string: "~/.config/my-llama-speech-assistant/config.json").expandingTildeInPath
+    }
+
+    /// Persists the current settings to the user config (highest priority on
+    /// next launch) so a backend switch in the UI survives a restart.
+    @discardableResult
+    func save() -> Bool {
+        let path = Self.userConfigPath
+        let directory = (path as NSString).deletingLastPathComponent
+        do {
+            try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            let data = try encoder.encode(self)
+            try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+            print("[Config] Saved to \(path)")
+            return true
+        } catch {
+            print("[Config] Failed to save \(path): \(error)")
+            return false
+        }
+    }
+
     func resolvedASRPath() -> String {
         let paths = [models.asrPath] + models.asrFallbackPaths
         for p in paths {

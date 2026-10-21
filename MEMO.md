@@ -84,6 +84,14 @@
 * **TTS 句子队列**：`ttsQueue` + `currentlySpeakingText`，一次只喂一句给
   `AVSpeechSynthesizer`。`toggleTTSSpeed()` 只把当前句放回队首并用新语速重播，保留其余队列；
   不再像旧实现那样 stop 后重播 `pendingSentence`（会丢句子、卡在 `.speaking`）。
+* **配置持久化**：`applyBackendSettings()` 调用 `AppConfig.save()` 写回
+  `~/.config/my-llama-speech-assistant/config.json`。此前 UI 里的 backend 切换只在内存生效，
+  重启后又会回到 `~/.config` 的 `opencode`（而该机器上 opencode 服务没起），于是"切到 llamacpp
+  后还是没反应"。用户机器上的 `~/.config` 已改为 `"backend": "llamacpp"`。
+* **失败可见**：ContentView 增加 `statusBanner`（errorMessage > loadingStatus > debugInfo）；
+  opencode 服务不可用时直接报错停在 Idle；llama.cpp/opencode 空回复也报错。
+* **诊断入日志**：`[AudioRecorder]`（输入格式/首帧/样本数/peak）、`[VAD]`、`ASR:`、
+  `PIPELINE:`、`[LlamaCpp]`/`[Opencode]`（URL/HTTP/错误体）都写入会话日志。
 
 ### 改动文件
 

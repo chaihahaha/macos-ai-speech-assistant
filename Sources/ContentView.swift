@@ -57,6 +57,8 @@ struct ContentView: View {
                 .background(Color.blue.opacity(0.1))
             }
 
+            statusBanner
+
             HStack {
                 Text("ASR: Qwen3-ASR-0.6B-MLX-4bit (local)")
                     .font(.caption)
@@ -248,6 +250,31 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    var statusBanner: some View {
+        if let error = viewModel.errorMessage, !error.isEmpty {
+            banner(error, color: .red)
+        } else if viewModel.isLoading, let status = viewModel.loadingStatus, !status.isEmpty {
+            banner(status, color: .orange)
+        } else if !viewModel.debugInfo.isEmpty {
+            banner(viewModel.debugInfo, color: .secondary)
+        }
+    }
+
+    @ViewBuilder
+    func banner(_ text: String, color: Color) -> some View {
+        HStack(spacing: 6) {
+            Text(text)
+                .font(.caption)
+                .foregroundColor(color)
+                .lineLimit(2)
+            Spacer()
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 4)
+        .background(color.opacity(0.08))
     }
 
     var stateStatusText: String {

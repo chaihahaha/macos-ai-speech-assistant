@@ -165,3 +165,44 @@ tap 回调先检查 active 标志，停止后立即返回。
 5. 切换 TTS 语速时不要 `stopSpeaking` 后重播 `pendingSentence`：那只是"还没说出口的 token 缓冲"，
    不是正在朗读的句子；会丢句子，而且清空计数后可能再也回不到监听。现在用显式句子队列
    （`ttsQueue` + `currentlySpeakingText`），切速时把当前句放回队首重播。
+
+---
+
+## 9. 配置优先级 + 后端切换不持久 + 失败静默 → "切到 llamacpp 后怎么说都没反应"
+
+**现象**
+
+录音、ASR 都正常（日志里有 `USER:`），但 `generating` 后 0.3s 直接 `inactive`，没有任何回复；
+重启后换成 llamacpp 依旧如此。
+
+**根因**
+
+1. `AppConfig.load()` 的查找顺序是 `~/.config/my-llama-speech-assistant/config.json` **优先**于
+   项目里的 `config.json`。用户界面里的 backend 切换（`applyBackendSettings`）原来**只改内存**，
+   不写回配置；所以每次重启又回到 `~/.config` 里的 `opencode`。
+2. 该机器上 opencode 服务（`127.0.0.1:9999`）当时没在运行。`ensureOpencodeServer()` 启动
+   `opencode serve` 后固定 `sleep 3s`，健康检查失败也**不中止**，继续发请求 → 连接失败 →
+   `onComplete()` → 直接回 Idle。日志里的 3 秒空档就是这段 sleep。
+3. 失败只 `print` 到 stdout，界面既不显示 `errorMessage` 也不显示 `debugInfo`，所以看起来像
+   "没反应/崩溃"。
+
+**修复**
+
+* `AppConfig.save()`：`applyBackendSettings()` 把当前 backend/URL 写回
+  `~/.config/my-llama-speech-assistant/config.json`，重启后保持选择。
+* `ensureOpencodeServer()` 返回 `Bool`；服务不可用时 `sendToOpencode` 直接报错并停在 Idle，
+  不再假装发请求。
+* ContentView 增加 `statusBanner`：优先显示 `errorMessage`，其次 `loadingStatus`，否则
+  `debugInfo`。后端/模型/撤销/语速等状态现在都可见。
+* 空回复也会报错（`llama.cpp/opencode returned no text`），不再静默。
+* 关键诊断写入会话日志：`[AudioRecorder]`（输入格式、首帧、样本数、peak）、`[VAD]`、
+  `ASR:`、`PIPELINE:`、`[LlamaCpp]` / `[Opencode]`（URL、HTTP 状态、错误体）。
+* 用户机器上的 `~/.config` 已改为 `"backend": "llamacpp"`（llama.cpp 8080 实测可用）。
+
+**排查顺序（下次遇到类似问题）**
+
+1. 看界面顶部 `statusBanner` 的错误文字。
+2. 看最新 `~/source/ai_talk_ideas/conversation_*.log`：有没有 `ASR:`、`PIPELINE: audio=...`、
+   `[LlamaCpp] HTTP ...`。
+3. 直接 `curl -s http://127.0.0.1:8080/v1/models` 确认后端；opencode 则
+   `curl -s http://127.0.0.1:9999/global/health`。

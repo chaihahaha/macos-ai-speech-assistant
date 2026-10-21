@@ -591,10 +591,15 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             let processor = StreamingVADProcessor(model: vad, config: vadConfig)
             // Dedicated capture engine (NOT the Now-Playing engine): stopping
             // it releases the microphone so Bluetooth can leave HFP mode.
-            recorder = AudioRecorder(targetSampleRate: 16000, vadProcessor: processor)
+            let recorder = AudioRecorder(targetSampleRate: 16000, vadProcessor: processor)
+            recorder.onLog = { [weak self] message in
+                self?.logConversation(message)
+            }
+            self.recorder = recorder
 
             loadingStatus = "Ready"
             debugInfo = "Models loaded (backend: \(selectedBackend))"
+            logConversation("[\(timestamp())] MODELS: loaded, backend=\(selectedBackend)")
         } catch {
             errorMessage = "Failed to load models: \(error.localizedDescription)"
             loadingStatus = nil
@@ -615,47 +620,79 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         llamaCppClient = nil
         currentSessID = nil
         mediaKeys.setPlaying()
-        debugInfo = "Backend settings applied"
+
+        // Persist the switch: otherwise the next launch silently falls back to
+        // the user config's backend (which may be a server that is not running).
+        var updated = appConfig
+        updated.backend = selectedBackend
+        updated.llamacpp.serverURL = llamacppURL
+        updated.opencode.serverURL = opencodeURL
+        updated.opencode.providerID = opencodeProviderID
+        updated.opencode.modelID = opencodeModelID
+        updated.opencode.agent = opencodeAgent
+        updated.opencode.directory = opencodeDirectory
+        let saved = updated.save()
+
+        errorMessage = nil
+        debugInfo = saved
+            ? "Backend: \(selectedBackend) (saved)"
+            : "Backend: \(selectedBackend) (FAILED to save config)"
+        logConversation("[\(timestamp())] BACKEND: \(selectedBackend) saved=\(saved)")
     }
 
     private func ensureBackendClient() {
         if selectedBackend == "opencode", opencodeClient == nil {
-            opencodeClient = OpencodeClient(
+            let client = OpencodeClient(
                 baseURL: opencodeURL,
                 directory: opencodeDirectory,
                 providerID: opencodeProviderID,
                 modelID: opencodeModelID,
                 agent: opencodeAgent
             )
+            client.log = { [weak self] message in
+                self?.logConversation("[Opencode] \(message)")
+            }
+            opencodeClient = client
         }
         if selectedBackend == "llamacpp", llamaCppClient == nil {
-            llamaCppClient = LlamaCppClient(
+            let client = LlamaCppClient(
                 baseURL: llamacppURL,
                 systemPrompt: appConfig.llamacpp.systemPrompt,
                 maxTokens: appConfig.llamacpp.maxTokens
             )
+            client.log = { [weak self] message in
+                self?.logConversation("[LlamaCpp] \(message)")
+            }
+            llamaCppClient = client
         }
     }
 
-    private func ensureOpencodeServer() async {
-        if await OpencodeClient.isServerRunning(opencodeURL) { return }
+    /// Returns `false` when the opencode server could not be made available.
+    @discardableResult
+    private func ensureOpencodeServer() async -> Bool {
+        if await OpencodeClient.isServerRunning(opencodeURL) { return true }
         loadingStatus = "Starting opencode serve..."
         debugInfo = "Starting opencode serve on \(opencodeURL)..."
+        logConversation("[\(timestamp())] OPENCODE: starting serve on \(opencodeURL)")
         guard let url = URL(string: opencodeURL),
               let host = url.host,
               let port = url.port else {
             loadingStatus = "Invalid opencode URL"
-            return
+            errorMessage = "Invalid opencode URL: \(opencodeURL)"
+            return false
         }
         opencodeServerProcess = OpencodeClient.startServer(hostname: host, port: port)
         try? await Task.sleep(nanoseconds: 3_000_000_000)
         if await !OpencodeClient.isServerRunning(opencodeURL) {
             loadingStatus = "Opencode server not available"
             debugInfo = "Failed to start opencode serve"
-        } else {
-            loadingStatus = "Opencode serve started"
-            debugInfo = "Opencode serve started on \(opencodeURL)"
+            logConversation("[\(timestamp())] OPENCODE: server NOT available at \(opencodeURL)")
+            return false
         }
+        loadingStatus = "Opencode serve started"
+        debugInfo = "Opencode serve started on \(opencodeURL)"
+        logConversation("[\(timestamp())] OPENCODE: server started")
+        return true
     }
 
     // MARK: - Recording callbacks
@@ -728,9 +765,11 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         }
 
         print("[VM] processAndSend, pendingAudio=\(pendingAudio.count) samples")
+        logConversation("[\(timestamp())] PIPELINE: audio=\(pendingAudio.count) samples (\(String(format: "%.2f", Double(pendingAudio.count) / 16000))s)")
         guard !pendingAudio.isEmpty else {
             stopConversation(caller: "processAndSend_noAudio")
             debugInfo = "Auto-stopped: no speech detected"
+            logConversation("[\(timestamp())] PIPELINE: no audio captured")
             return
         }
 
@@ -753,6 +792,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         guard isCurrent(gen), !Task.isCancelled, conversationState == .transcribing else {
             print("[VM] dropping stale ASR result (gen changed or cancelled)")
+            logConversation("[\(timestamp())] PIPELINE: stale ASR result dropped")
             return
         }
 
@@ -760,6 +800,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         let trimmed = asrText.trimmingCharacters(in: .whitespacesAndNewlines)
         print("[VM] ASR result: '\(trimmed)' len=\(trimmed.count)")
+        logConversation("[\(timestamp())] ASR: '\(trimmed)'")
         guard !trimmed.isEmpty else {
             stopConversation(caller: "processAndSend_emptyASR")
             debugInfo = "Auto-stopped: empty ASR"
@@ -769,6 +810,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         guard isValidSpeech(trimmed) else {
             stopConversation(caller: "processAndSend_noise")
             debugInfo = "Auto-stopped: noise filtered"
+            logConversation("[\(timestamp())] PIPELINE: ASR text filtered as noise")
             return
         }
 
@@ -777,6 +819,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         logMessage(messages.last!)
         debugInfo = "Transcribed: \(trimmed)"
 
+        logConversation("[\(timestamp())] PIPELINE: sending to backend=\(selectedBackend)")
         if selectedBackend == "opencode" {
             await sendToOpencode(trimmed, generation: gen)
         } else {
@@ -862,6 +905,9 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                     if !assistantText.isEmpty {
                         self.messages.append(Message(role: .assistant, text: assistantText))
                         self.logMessage(self.messages.last!)
+                    } else {
+                        self.errorMessage = "llama.cpp returned no text. Check \(self.llamacppURL) and the server log."
+                        self.logConversation("[\(self.timestamp())] ERROR: llama.cpp returned no text")
                     }
 
                     if !self.pendingSentence.isEmpty {
@@ -885,7 +931,13 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     private func sendToOpencode(_ text: String, generation gen: UInt64) async {
-        await ensureOpencodeServer()
+        guard await ensureOpencodeServer() else {
+            guard isCurrent(gen) else { return }
+            errorMessage = "opencode server unavailable at \(opencodeURL). Switch to llama.cpp or start 'opencode serve'."
+            logConversation("[\(timestamp())] ERROR: opencode server unavailable")
+            stopConversation(caller: "sendToOpencode_serverUnavailable")
+            return
+        }
 
         guard isCurrent(gen), !Task.isCancelled else {
             print("[VM] sendToOpencode aborted (generation changed)")
@@ -925,6 +977,9 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                         self.messages.append(Message(role: .assistant, text: self.opencodeResponseText))
                         self.logMessage(self.messages.last!)
                         self.opencodeResponseText = ""
+                    } else {
+                        self.errorMessage = "opencode returned no text. Check the server at \(self.opencodeURL)."
+                        self.logConversation("[\(self.timestamp())] ERROR: opencode returned no text")
                     }
 
                     if !self.pendingSentence.isEmpty {

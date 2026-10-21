@@ -9,6 +9,8 @@ final class OpencodeClient {
     private var sessionID: String?
     private var onTextDelta: ((String) -> Void)?
     private var onComplete: (() -> Void)?
+    /// Diagnostics sink (written into the conversation log by the ViewModel).
+    var log: ((String) -> Void)?
     private var completeCalled = false
 
     init(baseURL: String, directory: String, providerID: String, modelID: String, agent: String) {
@@ -78,12 +80,19 @@ final class OpencodeClient {
             req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
             let (data, response) = try await URLSession.shared.data(for: req, delegate: nil)
-            if let httpResponse = response as? HTTPURLResponse {
-                print("[Opencode] v1 message HTTP \(httpResponse.statusCode)")
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            print("[Opencode] v1 message HTTP \(status)")
+            log?("POST \(url.absoluteString) -> HTTP \(status)")
+            guard (200...299).contains(status) else {
+                let body = String(data: data, encoding: .utf8)?.prefix(300) ?? ""
+                log?("HTTP error body: \(body)")
+                await callComplete()
+                return
             }
             guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let info = json["info"] as? [String: Any] else {
                 print("[Opencode] Invalid v1 response")
+                log?("invalid response: \(String(data: data, encoding: .utf8)?.prefix(300) ?? "")")
                 await callComplete()
                 return
             }
@@ -100,6 +109,7 @@ final class OpencodeClient {
             }
 
             print("[Opencode] v1 response: \(responseText.count) chars, finish=\(finish ?? "nil")")
+            log?("response \(responseText.count) chars, finish=\(finish ?? "nil")")
             if !responseText.isEmpty {
                 let responseChunk = responseText
                 await MainActor.run { self.onTextDelta?(responseChunk) }
@@ -107,6 +117,7 @@ final class OpencodeClient {
             await callComplete()
         } catch {
             print("[Opencode] Send error: \(error)")
+            log?("send error: \(error.localizedDescription)")
             if !Task.isCancelled { await callComplete() }
         }
     }

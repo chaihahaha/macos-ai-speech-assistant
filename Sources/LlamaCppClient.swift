@@ -6,6 +6,8 @@ final class LlamaCppClient: @unchecked Sendable {
     let maxTokens: Int
     var onTextDelta: ((String) -> Void)?
     var onComplete: ((String) -> Void)?
+    /// Diagnostics sink (written into the conversation log by the ViewModel).
+    var log: ((String) -> Void)?
     var completeCalled = false
     private var streamingTask: Task<Void, Never>?
 
@@ -60,10 +62,24 @@ final class LlamaCppClient: @unchecked Sendable {
             }
 
             print("[LlamaCpp] Starting streaming request to \(baseURL)")
+            log?("POST \(url.absoluteString)")
 
             do {
                 let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? -1
                 print("[LlamaCpp] Got response: \(response)")
+                log?("HTTP \(status)")
+
+                if status != 200 {
+                    var body = ""
+                    for try await byte in bytes {
+                        body.append(Character(UnicodeScalar(byte)))
+                        if body.count > 500 { break }
+                    }
+                    log?("HTTP error body: \(body)")
+                    await callComplete("")
+                    return
+                }
 
                 var lineBuffer = Data()
                 for try await byte in bytes {
@@ -95,11 +111,13 @@ final class LlamaCppClient: @unchecked Sendable {
             } catch {
                 if !Task.isCancelled {
                     print("[LlamaCpp] Stream error: \(error)")
+                    log?("stream error: \(error.localizedDescription)")
                 }
             }
 
             let totalTime = Date().timeIntervalSince(startTime)
             print("[LlamaCpp] Finished in \(String(format: "%.2f", totalTime))s, \(assistantText.count) chars")
+            log?("finished \(String(format: "%.2f", totalTime))s, \(assistantText.count) chars")
             await callComplete(assistantText)
         }
     }
