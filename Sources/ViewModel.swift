@@ -128,13 +128,15 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             self?.logConversation(message)
         }
         mediaKeys.setHandlers(
+            // EDIFIER X Fit: a double press on either earbud is the only
+            // gesture that maps to play/pause (single presses send nothing at
+            // all), so this is the primary talk control.
             playPause: { [weak self] in self?.handlePlayPause() },
-            // The EDIFIER X Fit (and many AVRCP headsets) report a *double*
-            // press on one earbud as `nextTrack`. Treat it as the same primary
-            // action so double-click is not silently "do nothing".
+            // EDIFIER X Fit: right-ear triple press reports as `nextTrack`.
+            // Treat it as the same primary action instead of silently toggling
+            // TTS speed (which looked like "the key does nothing").
             nextTrack: { [weak self] in self?.handlePlayPause() },
-            // A triple press reports as `previousTrack` on headsets that send
-            // it at all; keep it for the TTS speed toggle.
+            // Not emitted by this headset; kept for other AVRCP devices.
             previousTrack: { [weak self] in self?.toggleTTSSpeed() }
         )
         mediaKeys.becomeNowPlaying()

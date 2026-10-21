@@ -304,6 +304,59 @@ func setupNSEventMonitors() {
     log("NSEvent", "global + local monitors installed (global=\(globalMonitor != nil) local=\(localMonitor != nil))")
 }
 
+// MARK: - On-screen HUD
+
+var hudWindow: NSWindow?
+var hudLabel: NSTextField?
+var hudHistory: [String] = []
+var hudTotal = 0
+
+/// A floating window is the unambiguous feedback channel: audio can be muted,
+/// routed to the headset, or confused with the earbud's own confirmation tone.
+func setupHUD() {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    app.finishLaunching()
+
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 640, height: 340),
+        styleMask: [.titled, .closable],
+        backing: .buffered,
+        defer: false
+    )
+    window.title = "Headset Monitor — 每收到一条命令这里就会更新"
+    window.level = .floating
+    window.isReleasedWhenClosed = false
+    window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+    let label = NSTextField(labelWithString: "等待按键…\n\n（只看这个窗口：它只显示 Mac 真正收到的媒体命令）")
+    label.font = NSFont.monospacedSystemFont(ofSize: 16, weight: .semibold)
+    label.textColor = .labelColor
+    label.frame = NSRect(x: 14, y: 14, width: 612, height: 312)
+    label.autoresizingMask = [.width, .height]
+    label.lineBreakMode = .byTruncatingTail
+    label.maximumNumberOfLines = 0
+    label.cell?.wraps = true
+    window.contentView?.addSubview(label)
+
+    window.center()
+    window.orderFrontRegardless() // show without stealing keyboard focus
+    hudWindow = window
+    hudLabel = label
+    log("HUD", "floating window shown")
+}
+
+func updateHUD(_ command: String) {
+    hudTotal += 1
+    hudHistory.insert("[\(wallClock.string(from: Date()))] \(command)", at: 0)
+    if hudHistory.count > 14 { hudHistory.removeLast() }
+    hudLabel?.stringValue = "共收到 \(hudTotal) 条媒体命令\n\n" + hudHistory.joined(separator: "\n")
+    hudLabel?.textColor = .systemGreen
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        hudLabel?.textColor = .labelColor
+    }
+}
+
 // MARK: - MPRemoteCommandCenter
 
 var silentEngine: AVAudioEngine?
@@ -321,19 +374,30 @@ func playbackStateName() -> String {
     }
 }
 
-/// Audible confirmation: one beep per command the Mac actually received. This
-/// makes it obvious whether a tap reached the Mac at all.
+/// Audible confirmation with a distinct pattern per command:
+///   play/pause -> 1 beep, nextTrack -> 2 beeps, previousTrack -> 3 beeps.
+/// This distinguishes *our* beeps from the earbud's own confirmation tone.
 func beep(for command: String) {
-    let sound: String
-    switch command {
-    case "play": sound = "Glass"
-    case "pause": sound = "Pop"
-    case "togglePlayPause": sound = "Tink"
-    case "nextTrack": sound = "Purr"
-    case "previousTrack": sound = "Bottle"
-    default: sound = "Funk"
+    func play(_ name: String, after delay: TimeInterval) {
+        if delay <= 0 {
+            NSSound(named: name)?.play()
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                NSSound(named: name)?.play()
+            }
+        }
     }
-    NSSound(named: sound)?.play()
+    switch command {
+    case "nextTrack":
+        play("Pop", after: 0)
+        play("Pop", after: 0.18)
+    case "previousTrack":
+        play("Bottle", after: 0)
+        play("Bottle", after: 0.18)
+        play("Bottle", after: 0.36)
+    default:
+        play("Tink", after: 0)
+    }
 }
 
 /// Behaves like a real media app: reflects transport changes in Now Playing so
@@ -383,6 +447,7 @@ func setupRemoteCommands() {
         command.addTarget { _ in
             log("MPRemote", ">>> \(name) received (state before=\(playbackStateName()))")
             DispatchQueue.main.async {
+                updateHUD(name)
                 beep(for: name)
                 applyTransportState(for: name)
                 log("MPRemote", "    state after=\(playbackStateName())")
@@ -562,7 +627,11 @@ if checkMode {
         log("SUMMARY", "\(counts)")
         exit(0)
     }
+    // Keep the process alive; all callbacks are driven by the main run loop.
+    RunLoop.main.run()
 } else {
+    setupHUD()
+
     signal(SIGINT, SIG_IGN)
     let sigSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
     sigSource.setEventHandler {
@@ -586,7 +655,8 @@ if checkMode {
             exit(0)
         }
     }
+
+    // NSApplication's run loop drives both the HUD and our dispatch sources.
+    NSApplication.shared.run()
 }
 
-// Keep the process alive; all callbacks are driven by the main run loop.
-RunLoop.main.run()

@@ -25,32 +25,39 @@
 | 8 | Now Playing keep-alive 强制 rate=1.0；无效命令仍 isEnabled | 暂停状态被系统误判，媒体键可能被路由走 | `MediaKeyController` |
 | 9 | 录音引擎与伪装播放引擎是同一个 `AVAudioEngine`，停止录音时不 `engine.stop()` | 麦克风常开 → 蓝牙停留在 HFP；keep-alive 引擎在 A2DP/HFP 切换时挂掉 → 丢 Now Playing → 媒体键失效；TTS 走 HFP 可能完全听不到 | `AudioRecorder` / `ViewModel.loadModels` |
 | 10 | 停止会话时把 `playbackState` 设为 `.paused` | macOS 可能不再把媒体键投给本 App | `ViewModel.stopConversation` |
-| 11 | 右耳双击 = `nextTrack` 被映射为 TTS 语速 | 双击看起来"没反应" | `ViewModel.setupMediaKeys` |
+| 11 | 右耳三击 = `nextTrack` 被映射为 TTS 语速 | 三击看起来"没反应" | `ViewModel.setupMediaKeys` |
 
 ### 真机诊断：EDIFIER X Fit（蓝牙）按键实测
 
-用 `scripts/HeadsetMonitor.swift`（`binaries/HeadsetMonitor`）实测，结论：
+用 `scripts/HeadsetMonitor.swift`（`binaries/HeadsetMonitor`）实测。先用日志时间戳推断、再用
+带**悬浮窗 HUD** 的版本逐一手势确认（用户亲眼看到窗口计数 +1 的手势才算），结论：
 
 * 该耳机**只通过蓝牙 AVRCP → MediaRemote** 传递按键；HID / `NX_SYSDEFINED` / NSEvent 通道
   **完全没有信号**（同一时间键盘事件能被 CGEventTap 正常捕获，排除权限问题）。
-* 逐一手势对应关系（用户按顺序按键 + 日志时间戳完全吻合）：
+* 逐一手势对应关系（**已用 HUD 逐条确认，2026-10-21**）：
 
 | 手势 | Mac 收到的命令 | 结果 |
 | --- | --- | --- |
-| 左耳单击 | `pause` / `play` | ✅ |
-| 左耳双击 | **无** | ❌ 固件层未发给 Mac（很可能被分配给 Siri/语音助手） |
-| 左耳三击 | **无** | ❌ |
-| 右耳单击 | `pause` / `play` | ✅ |
-| 右耳双击 | `nextTrack` | ✅ |
-| 右耳三击 | **无** | ❌ |
+| 左耳单击 | **无任何事件** | ❌ 固件不发 |
+| 左耳双击 | `pause` / `play` | ✅ |
+| 左耳三击 | **无任何事件** | ❌ |
+| 右耳单击 | **无任何事件** | ❌ 固件不发 |
+| 右耳双击 | `pause` / `play` | ✅ |
+| 右耳三击 | `nextTrack` | ✅ |
 
-* 因此：**App 必须始终是 Now Playing App**，这是该耳机按键唯一的投递路径；丢掉 Now Playing
-  就等于按键全灭。旧代码里"录音引擎 = 伪装播放引擎"导致麦克风常开、蓝牙在 A2DP/HFP 间切换、
-  keep-alive 引擎挂掉 —— 这就是"有时候单击没反应"的真正原因。
-* 左耳双击/三击、右耳三击在 Mac 侧收不到任何事件，**软件无法修复**；需在 EDIFIER Connect
-  之类的厂商 App 里改手势分配，或接受该限制。
-* 右耳双击 = `nextTrack`，已改为与单击相同的会话开关（否则双击只会静默切换 TTS 语速，
+* 修正记录：最初按时间戳推断时把"单击"误当成了 `play/pause`；实际是**单击完全不发**，
+  `play/pause` 来自**双击**（左右耳双击都发 `play/pause`，无法区分左右）。
+  上一轮 24 个手势共 12 条事件的正确分解是：8 个双击 → 8 条 play/pause，
+  4 个右耳三击 → 4 条 nextTrack，8 个单击 + 4 个左耳三击 → 0 条。
+* 因此：**这只耳机的可用手势是"双击"（主操作）和"右耳三击"（nextTrack）**。
+  单击永远不会有反应，不是 App 的 bug。
+* App 必须始终是 Now Playing App，这是该耳机按键唯一的投递路径；丢掉 Now Playing 就等于
+  按键全灭。旧代码里"录音引擎 = 伪装播放引擎"导致麦克风常开、蓝牙在 A2DP/HFP 间切换、
+  keep-alive 引擎挂掉 —— 这是"有时候双击也没反应"的真正原因。
+* 右耳三击 = `nextTrack`，已改为与双击相同的会话开关（否则它会静默切换 TTS 语速，
   看起来就像"没反应"）。
+* 左耳三击、左右单击在 Mac 侧收不到任何事件，**软件无法修复**；需在 EDIFIER Connect
+  之类的厂商 App 里改手势分配，或接受该限制。
 
 ### 关键设计决策
 
