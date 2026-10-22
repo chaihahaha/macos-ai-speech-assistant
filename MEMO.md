@@ -117,6 +117,8 @@
 * **持久 HFP 会话**：整个对话期间保持同一个 input-only engine（HFP），说完只
   `finishCapture()` 保留 engine/tap，下一轮 `resumeCapture()`；不再每轮 A2DP↔HFP 切换。
   TTS 在 HFP 里播放（通话音质）。只有 idle/打断/撤销才拆 engine 回 A2DP。
+* **TTS 结束直接进 listening**：持久 HFP/AVCapture 会话已不需要重置蓝牙，`finishTurn()`
+  不再经过 1.5s idle，直接 `startListening()`；三段回放验证 speaking → listening 无 inactive 间隔。
 * **三击状态映射（最终）**：idle = 撤销最近一轮（最后一条 user + 其后的 assistant）；
   transcribing / generating / speaking = 回 idle（生成未完成时等生成完、保留文本）；
   listening / waitingSilence（录音 HFP）= 收不到，保留安全丢弃分支。录音超时默认 **30s**。

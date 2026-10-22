@@ -619,8 +619,11 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     /// listening for the next turn. Interrupts/undo/triple do NOT use this path.
     private func finishTurn() {
         guard conversationState != .inactive else { return }
-        print("[VM] cycle complete, resuming listening (state was \(conversationState.rawValue))")
-        enterIdle(noAutoResume: false, debugInfo: "Done. Listening again…")
+        // Persistent HFP: the capture session is still running, so there is no
+        // Bluetooth profile to reset. Go straight from TTS end to listening
+        // instead of flashing idle for 1.5 s.
+        print("[VM] cycle complete, continuing listening immediately")
+        startListening()
     }
 
     // MARK: - Logging
