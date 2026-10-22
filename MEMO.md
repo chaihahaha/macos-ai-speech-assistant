@@ -117,6 +117,9 @@
 * **持久 HFP 会话**：整个对话期间保持同一个 input-only engine（HFP），说完只
   `finishCapture()` 保留 engine/tap，下一轮 `resumeCapture()`；不再每轮 A2DP↔HFP 切换。
   TTS 在 HFP 里播放（通话音质）。只有 idle/打断/撤销才拆 engine 回 A2DP。
+* **三击状态映射（最终）**：idle = 撤销最近一轮（最后一条 user + 其后的 assistant）；
+  transcribing / generating / speaking = 回 idle（生成未完成时等生成完、保留文本）；
+  listening / waitingSilence（录音 HFP）= 收不到，保留安全丢弃分支。录音超时默认 **30s**。
 * **录音时的三击不可行**：实测即使把静音 keep-alive 放内置扬声器、App 保持 Now Playing，
   录音（HFP）期间也收不到任何 AVRCP 事件 → 耳机固件在 HFP 下不发媒体键。该方案已回退
   （还会让 TTS 路由变噪音）。录音中退出只能用界面按钮。

@@ -106,7 +106,7 @@ struct AppConfig: Codable, Sendable {
         vad: VADSettings(
             onset: 0.5, offset: 0.35,
             minSpeechDuration: 0.25, minSilenceDuration: 1.0,
-            silenceTimeout: 5.0, maxRecordingDuration: 60.0
+            silenceTimeout: 5.0, maxRecordingDuration: 30.0
         ),
         tts: TTSSettings(rate: 0.95, slowRate: 0.5, fastRate: 1.3),
         conversationHistoryPath: NSString(string: "~/source/ai_talk_ideas").expandingTildeInPath

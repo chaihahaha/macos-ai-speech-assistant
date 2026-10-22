@@ -44,7 +44,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @Published var isTyping = false
     @Published var silenceTimerValue: Double = 5.0
     @Published var ttsRateLabel: String = ""
-    @Published var recordingTimeout: Double = 60
+    @Published var recordingTimeout: Double = 30
     @Published var currentSessID: String? = nil
 
     @Published var selectedBackend: String = "opencode"
@@ -124,7 +124,7 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         // the fast setting (config.json -> tts.fastRate).
         let configuredRate = appConfig.tts.fastRate > 0 ? appConfig.tts.fastRate : 1.3
         ttsRate = configuredRate
-        recordingTimeout = appConfig.vad.maxRecordingDuration > 0 ? appConfig.vad.maxRecordingDuration : 60
+        recordingTimeout = appConfig.vad.maxRecordingDuration > 0 ? appConfig.vad.maxRecordingDuration : 30
         ttsRateLabel = String(format: "%.2fx", configuredRate)
 
         selectedBackend = appConfig.backend
@@ -239,12 +239,16 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         print("[MediaKey] handleTriplePress, state=\(conversationState.rawValue) streamingComplete=\(streamingComplete)")
         switch conversationState {
         case .inactive:
+            // Idle: revert the most recent completed user+assistant turn.
             undoLastConversation()
         case .listening, .waitingSilence:
+            // Recording is HFP; the headset does not send AVRCP here, so this
+            // normally never fires. Keep it as a safe discard if it ever does.
             stopConversation(caller: "triple")
             debugInfo = "Discarded this recording (idle)."
             logConversation("[\(timestamp())] TRIPLE: discarded recording, idle")
         case .transcribing:
+            // Non-recording: back to idle and drop this partial turn.
             interruptConversation()
             debugInfo = "Discarded this recording (idle)."
             logConversation("[\(timestamp())] TRIPLE: discarded recognition, idle")
