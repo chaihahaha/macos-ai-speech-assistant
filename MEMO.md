@@ -119,9 +119,10 @@
   TTS 在 HFP 里播放（通话音质）。只有 idle/打断/撤销才拆 engine 回 A2DP。
 * **TTS 结束直接进 listening**：持久 HFP/AVCapture 会话已不需要重置蓝牙，`finishTurn()`
   不再经过 1.5s idle，直接 `startListening()`；三段回放验证 speaking → listening 无 inactive 间隔。
-* **三击状态映射（最终）**：idle = 撤销最近一轮（最后一条 user + 其后的 assistant）；
-  transcribing / generating / speaking = 回 idle（生成未完成时等生成完、保留文本）；
-  listening / waitingSilence（录音 HFP）= 收不到，保留安全丢弃分支。录音超时默认 **30s**。
+* **三击状态映射（最终）**：只有 **idle（A2DP）** 能收到 nextTrack → 撤销最近一轮；
+  listening / waitingSilence / transcribing / generating / speaking 都是持久 HFP，
+  耳机固件不发 AVRCP，事件到不了 App；已删除这些状态的三击分支（只保留 ignore 日志）。
+  录音超时默认 **30s**。
 * **录音时的三击不可行**：实测即使把静音 keep-alive 放内置扬声器、App 保持 Now Playing，
   录音（HFP）期间也收不到任何 AVRCP 事件 → 耳机固件在 HFP 下不发媒体键。该方案已回退
   （还会让 TTS 路由变噪音）。录音中退出只能用界面按钮。

@@ -79,7 +79,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private var streamingComplete = false
     /// Triple press while the LLM is still streaming: stop speaking now, but let
     /// the generation finish so its text is preserved, then go idle.
-    private var gracefulExitPending = false
     /// Maps each utterance to the generation that queued it, so completions
     /// coming from a stopped/interrupted cycle can be ignored.
     private var utteranceGenerations: [ObjectIdentifier: UInt64] = [:]
@@ -236,46 +235,15 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     ///   LLM finish, keep the assistant text, then idle.
     /// * Speaking after generation finished: stop TTS, keep the text, idle.
     private func handleTriplePress() {
-        print("[MediaKey] handleTriplePress, state=\(conversationState.rawValue) streamingComplete=\(streamingComplete)")
-        switch conversationState {
-        case .inactive:
-            // Idle: revert the most recent completed user+assistant turn.
-            undoLastConversation()
-        case .listening, .waitingSilence:
-            // Recording is HFP; the headset does not send AVRCP here, so this
-            // normally never fires. Keep it as a safe discard if it ever does.
-            stopConversation(caller: "triple")
-            debugInfo = "Discarded this recording (idle)."
-            logConversation("[\(timestamp())] TRIPLE: discarded recording, idle")
-        case .transcribing:
-            // Non-recording: back to idle and drop this partial turn.
-            interruptConversation()
-            debugInfo = "Discarded this recording (idle)."
-            logConversation("[\(timestamp())] TRIPLE: discarded recognition, idle")
-        case .generating, .speaking:
-            if streamingComplete {
-                // Generation finished and the assistant text is already saved.
-                stopSynthesis()
-                enterIdle(noAutoResume: true, debugInfo: "Done (idle). Triple again to undo.")
-                logConversation("[\(timestamp())] TRIPLE: stopped TTS, idle")
-            } else {
-                gracefulExitAfterGeneration()
-            }
+        print("[MediaKey] handleTriplePress, state=\(conversationState.rawValue)")
+        guard conversationState == .inactive else {
+            // Persistent HFP: the headset does not send AVRCP in any
+            // conversation state. Only idle (A2DP) can deliver nextTrack.
+            logConversation("[\(timestamp())] TRIPLE: ignored in \(conversationState.rawValue) (HFP has no AVRCP)")
+            return
         }
-    }
-
-    /// Stop speaking immediately, but let the in-flight generation finish so the
-    /// assistant text is preserved. `onComplete` appends it and goes idle.
-    private func gracefulExitAfterGeneration() {
-        guard !gracefulExitPending else { return }
-        gracefulExitPending = true
-        stopSynthesis()
-        if conversationState == .speaking {
-            conversationState = .generating
-            logStateChange(.generating)
-        }
-        debugInfo = "Finishing generation, then idle…"
-        logConversation("[\(timestamp())] TRIPLE: graceful exit (waiting for generation to finish)")
+        // Idle (A2DP): revert the most recent completed user+assistant turn.
+        undoLastConversation()
     }
 
     // MARK: - State transitions
@@ -359,7 +327,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         ttsQueue.removeAll()
         currentlySpeakingText = nil
         utteranceGenerations.removeAll()
-        gracefulExitPending = false
         pendingAudio = []
         currentTurnUserMessageID = nil
 
@@ -451,7 +418,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         pendingAudio = []
         opencodeResponseText = ""
         currentTurnUserMessageID = nil
-        gracefulExitPending = false
         llamaCppClient?.cancel()
         opencodeClient?.cancelPending()
         Task { await opencodeClient?.interrupt() }
@@ -485,7 +451,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         stopSynthesis()
         isTyping = false
-        gracefulExitPending = false
         llamaCppClient?.cancel()
         opencodeClient?.cancelPending()
         Task { await opencodeClient?.interrupt() }
@@ -596,27 +561,8 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         }
     }
 
-    private func enterIdle(noAutoResume: Bool, debugInfo text: String) {
-        conversationState = .inactive
-        logStateChange(.inactive)
-        isTyping = false
-        currentTurnUserMessageID = nil
-        debugInfo = text
-        mediaKeys.setPlaying()
-        if noAutoResume {
-            restartTask?.cancel()
-            restartTask = nil
-            // Conversation over: release HFP and return to A2DP.
-            _ = stopRecordingFullyAndResumeA2DP()
-        } else {
-            // Keep the HFP engine alive across turns; the next startListening()
-            // just resumes collecting on it.
-            scheduleStartListening(after: 1.5, reason: "turnFinished")
-        }
-    }
-
-    /// A turn finished **normally**: go idle briefly and automatically resume
-    /// listening for the next turn. Interrupts/undo/triple do NOT use this path.
+    /// A turn finished **normally**: continue listening immediately on the
+    /// persistent HFP session (no idle gap).
     private func finishTurn() {
         guard conversationState != .inactive else { return }
         // Persistent HFP: the capture session is still running, so there is no
@@ -1127,7 +1073,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         didSpeakFirstUtterance = false
         pendingSentence = ""
         streamingComplete = false
-        gracefulExitPending = false
         ttsQueue.removeAll()
         currentlySpeakingText = nil
         utteranceGenerations.removeAll()
@@ -1182,14 +1127,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                     } else {
                         self.errorMessage = "llama.cpp returned no text. Check \(self.llamacppURL) and the server log."
                         self.logConversation("[\(self.timestamp())] ERROR: llama.cpp returned no text")
-                    }
-
-                    if self.gracefulExitPending {
-                        self.gracefulExitPending = false
-                        self.pendingSentence = ""
-                        self.enterIdle(noAutoResume: true, debugInfo: "Done (idle). Triple again to undo.")
-                        self.logConversation("[\(self.timestamp())] TRIPLE: generation finished, idle")
-                        return
                     }
 
                     if !self.pendingSentence.isEmpty {
@@ -1264,14 +1201,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                         self.logConversation("[\(self.timestamp())] ERROR: opencode returned no text")
                     }
 
-                    if self.gracefulExitPending {
-                        self.gracefulExitPending = false
-                        self.pendingSentence = ""
-                        self.enterIdle(noAutoResume: true, debugInfo: "Done (idle). Triple again to undo.")
-                        self.logConversation("[\(self.timestamp())] TRIPLE: generation finished, idle")
-                        return
-                    }
-
                     if !self.pendingSentence.isEmpty {
                         self.speakSentence(self.pendingSentence)
                         self.pendingSentence = ""
@@ -1288,9 +1217,6 @@ final class ViewModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     private func streamTTSToken(_ token: String) {
-        // Triple press asked us to finish generation silently.
-        guard !gracefulExitPending else { return }
-
         pendingSentence += token
 
         let sentenceEnders = CharacterSet(charactersIn: ".!?。！？\n")

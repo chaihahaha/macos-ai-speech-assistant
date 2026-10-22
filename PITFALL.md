@@ -29,7 +29,10 @@
 10. **TTS**：keep-alive 与 TTS 共存才能听到（TTS 前停 keep-alive 会只剩噪音）；首句
     `preUtteranceDelay=0.15` 防吞字；TTS 走队列、逐句 `speak`，完成后再回 idle。
 
-**遗留**：环境噪声偶尔仍会让 ASR 幻觉出英文。现有 RMS 门限（0.003/0.002）可继续调高，
+**三击最终结论**：持久 HFP 覆盖整个对话（listening/transcribing/generating/speaking），
+耳机在 HFP 下不发 AVRCP，三击在这些状态物理上到不了 App；只有 idle（停 session 回 A2DP）
+能收到 nextTrack。非 idle 的三击分支已删除，只保留 idle 撤销最近一轮。
+环境噪声偶尔仍会让 ASR 幻觉出英文。现有 RMS 门限（0.003/0.002）可继续调高，
 或对短片段/低能量片段直接丢弃；VAD onset 也可调保守一些。
 
 **回归方式**：`TEST_AUDIO_DIR="$PWD/audios" TEST_AUTO_START=1 ./.build/debug/MyLlamaSpeechAssistant`
